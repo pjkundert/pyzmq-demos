@@ -3,3 +3,124 @@ Python ZeroMQ Demos
     These are my initial attempts to build some proof-of-concept
 experiments using 0MQ's Python bindings.
 
+
+
+pool
+
+    One key problem we need to solve is to allow any one server in a
+pool of services on a host, send a request to *all* such services --
+both on its own host, plus possibly on a number of other hosts.  The
+problems are:
+
+1) We don't want every server connecting to one server; ideally, they
+   would all elect one of themselves as a "master" on the host, and
+   connect to that one.  In turn, all the "master" servers on every
+   host would connect, and distribute any requests out.  All responses
+   would make their way back to the issuer of the request.
+
+2) Server failure is fine, but we need to know when all responses
+   (from every non-failed server) have been collected.  We can simply
+   wait and hope that each server eventually either fails and
+   disconnects, or returns a response -- but this would not account
+   for "hung" servers.  So, we need to implement an out-of-band "ping"
+   with a response timeout to test for live-ness.  Alternatievely, we
+   could have timely "working" messages returned, followed eventually
+   by a response (or abandonment of the failed server).
+
+3) Detection and mitigation of a failed "master" node is more
+   difficult; if it is hung, then all other servers on the host are
+   cut off from communicating.  Furthermore, they cannot re-elect a
+   new master and re-bind -- because the interface:port remains bound
+   by the disabled "master"...  If a quorum of servers on a host
+   decide that their "master" is hung, perhaps they should decide to
+   kill it?
+
+
+
+assigner
+
+    One of the libraries we use behind a webserver improperly
+conflates the ideas of a Hit and a Thread.  Each API call used during
+processing of a Hit in the web-page code has (traditionally) been
+handled by the same thread, from start to finish.
+
+    We wish to un-embed this library from within the web server
+(because the IIS webserver is broken/misdesigned in ways that prevent
+us from debugging our embedded native-code library).  Using an RPC
+mechanism (WCF, Zero-C ICE, ...) is possible, but some of the API
+deals in (very) large binary object transfers, so 0MQ seemed in some
+ways like a better fit.
+
+    This unfortunate Hit==Thread assumption is probably too difficult
+to pry out of the existing code, so we must ensure that when a Hit is
+started in the Web Server, a remote server is assigned to carry out
+all the requests for the Hit, using a single thread assigned for the
+complete duration of the Hit.  Each server may be servicing a multitude
+of such Hits, simultaneously.  
+
+    This doesn't match well with the common "Thread Pool" designs of
+RPC libraries, which have a stable of Threads awaiting the next
+incoming RPC request, and then carry out the local method invocation
+against the correct object.  The correct serialized set of method
+invocations indeed occurs against the correct local object -- but a
+different Thread might be used to perform each one!  Techniques like
+Zero-C ICE "AMD" (Asynchronous Method Dispatch) can be used to
+transfer responsibility for the incoming method invocation from the
+RPC thread(s) to the assigned Hit thread, but this adds yet another
+layer of complexity to an already complex solution. 
+
+    Using 0MQ, we can quickly establish a new session to any one of
+the M available servers, (perhaps even using a DNS SRV record for
+statistically distributing connections by weighting), and spawn a
+thread in the server to await, receive, carry out and respond to all
+subsequent requests.  Finally, the connection is closed and the Hit's
+resources freed in the server.  We get both 1:1 Thread mapping in the
+client (webserver) and the server, plus "free" HA/HP using DNS SRV
+records and multiple hosts/server pools.
+
+    Alternatively, we could use straight 0MQ REQ/REP to select a
+server.  Problem is, the multitude of webserver processes must connect
+to the multitude of servers; we don't want to have that; nor do we
+want to manage a N:1 queue "forwarder" for each webserver (IIS App
+Pool) host -- an incoming Hit from one of the N IIS webservers must
+*directly* connect to exaclty one of the M available servers.  So, a
+1:1 0MQ REQ/REP socket will be created and destroyed for each Hit.
+
+PROTOTYPE (incomplete, but operational)
+
+    The resultant prototype uses 2 zmq.REQ sockets in the client; one
+for requesting the address of a worker, and one to send work to it. 
+
+    WARNING: This will *only* work with a single broker; we need to
+get the broker's address, as well as the server address, and use a
+different socket type to communicate to the server...
+
+assigner/aserver_scale1.py
+
+    'WAITING'            -->   waiting
+    'WAITING' <address> <--    waiting
+
+    <address> 'Hello'    -->   broker
+    'World'             <--    broker
+    
+assigner/aclient_scale1.py
+
+client           broker                         (server thread)
+------           ----------------------         ---------------
+                       
+                 -->  waiting  --> |
+	                             [idle] <-- server
+     <address>  <--   waiting <--  |
+
+<address> work  -->  broker   -->   server
+	                                 ....
+      response <--   broker  <--    server
+
+
+Run:
+
+        $ python aserver_scale1.py &
+        $ python aclient_scale1.py &   # As many times as you want...
+
+    You'll need to kill the server; it doesn't yet respond to keyboard
+interrupts and shut down cleanly.
