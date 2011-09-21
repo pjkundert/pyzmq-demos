@@ -39,52 +39,70 @@ problems are:
 
 assigner
 
-    One of the libraries we use behind a webserver improperly
-conflates the ideas of a Hit and a Thread.  Each API call used during
-processing of a Hit in the web-page code has (traditionally) been
-handled by the same thread, from start to finish.
+    One of the libraries we use behind a webserver improperly conflates the
+ideas of a Hit and a Thread.  Each API call used during processing of a Hit in
+the web-page code has (traditionally) been handled by the same thread, from
+start to finish.
 
-    We wish to un-embed this library from within the web server
-(because the IIS webserver is broken/misdesigned in ways that prevent
-us from debugging our embedded native-code library).  Using an RPC
-mechanism (WCF, Zero-C ICE, ...) is possible, but some of the API
-deals in (very) large binary object transfers, so 0MQ seemed in some
-ways like a better fit.
+    We wish to un-embed this library from within the web server (because the IIS
+webserver is broken/misdesigned in ways that prevent us from debugging our
+embedded native-code library).  Using an RPC mechanism (WCF, Zero-C ICE, ...) is
+possible, but some of the API deals in (very) large binary object transfers, so
+0MQ seemed in some ways like a better fit.
 
-    This unfortunate Hit==Thread assumption is probably too difficult
-to pry out of the existing code, so we must ensure that when a Hit is
-started in the Web Server, a remote server is assigned to carry out
-all the requests for the Hit, using a single thread assigned for the
-complete duration of the Hit.  Each server may be servicing a multitude
-of such Hits, simultaneously.  
+    This unfortunate Hit==Thread assumption is probably too difficult to pry out
+of the existing code, so we must ensure that when a Hit is started in the Web
+Server, a remote server is assigned to carry out all the requests for the Hit,
+using a single thread assigned for the complete duration of the Hit.  Each
+server may be servicing a multitude of such Hits, simultaneously.
 
-    This doesn't match well with the common "Thread Pool" designs of
-RPC libraries, which have a stable of Threads awaiting the next
-incoming RPC request, and then carry out the local method invocation
-against the correct object.  The correct serialized set of method
-invocations indeed occurs against the correct local object -- but a
-different Thread might be used to perform each one!  Techniques like
-Zero-C ICE "AMD" (Asynchronous Method Dispatch) can be used to
-transfer responsibility for the incoming method invocation from the
-RPC thread(s) to the assigned Hit thread, but this adds yet another
-layer of complexity to an already complex solution. 
 
-    Using 0MQ, we can quickly establish a new session to any one of
-the M available servers, (perhaps even using a DNS SRV record for
-statistically distributing connections by weighting), and spawn a
-thread in the server to await, receive, carry out and respond to all
-subsequent requests.  Finally, the connection is closed and the Hit's
-resources freed in the server.  We get both 1:1 Thread mapping in the
-client (webserver) and the server, plus "free" HA/HP using DNS SRV
-records and multiple hosts/server pools.
+RPC Thread Pools vs. Assigned Server
 
-    Alternatively, we could use straight 0MQ REQ/REP to select a
-server.  Problem is, the multitude of webserver processes must connect
-to the multitude of servers; we don't want to have that; nor do we
-want to manage a N:1 queue "forwarder" for each webserver (IIS App
-Pool) host -- an incoming Hit from one of the N IIS webservers must
-*directly* connect to exaclty one of the M available servers.  So, a
-1:1 0MQ REQ/REP socket will be created and destroyed for each Hit.
+    This "Assigned Server Thread" model doesn't match well with the common
+"Thread Pool" designs of RPC libraries.  Typically, they have a stable of
+threads awaiting the next incoming RPC request, and then carry out the local
+method invocation against the correct object.  The correct serialized set of
+method invocations indeed occurs against the correct local object -- but a
+different Thread might be used to perform each one!  Techniques like Zero-C ICE
+"AMD" (Asynchronous Method Dispatch) can be used to transfer responsibility for
+the incoming method invocation from the RPC thread(s) to the assigned Hit
+thread, but this adds yet another layer of complexity to an already complex
+solution.
+
+    Using 0MQ, we could establish a persistent connection to 1 to N brokers by
+supplying all of their addresses to multiple connect calls, using the same
+socket.  0MQ transparently distributes individual messages (requests) to the
+servers, using Nagle's Fair Queueing algorithm (unfortunately, it doesn't
+perform weighted fair queueing, like TCP connects based on SRV records would.)
+Also, the connections are persistent, and are transparently established and
+maintained by 0MQ, behind the scenes.  Any requests sent to crashed servers are
+lost, so end-to-end out-of-band "ping" or "i-am-alive" messages would be
+required (by the client end) to ascertain liveness.  But most importantly --
+each request is transparantly fair-queued to *any* available server; subsequent
+requests would almost never go to the same thread (or even the same server
+process, on the same box!)
+
+    Therefore, we need to use a two step process:
+
+1) Allocate a server thread using a 0MQ REQ/REP socket connected to every server
+   broker.  The response contains a routing path to the responding server
+   thread.  The path must contain the socket ID of the broker, and the socket ID
+   of the server thread.
+
+2a) Route messages from the client to the server via XREP/XREQ (NOTE reversal
+    from normal usage!)    The broker recognizes
+or
+
+2b) Create a PAIR socket, and connect directly to a specific server's public PAIR
+    socket.   Obviously, only 
+
+ If we use straight 0MQ REQ/REP to select a server.  Problem is, the multitude
+of webserver processes must connect to the multitude of servers; we don't want
+to have that; nor do we want to manage a N:1 queue "forwarder" for each
+webserver (IIS App Pool) host -- an incoming Hit from one of the N IIS
+webservers must *directly* connect to exactly one of the M available servers.
+So, a 1:1 0MQ REQ/REP socket will be created and destroyed for each Hit.
 
 PROTOTYPE (incomplete, but operational)
 
@@ -112,9 +130,9 @@ client           broker                         (server thread)
 	                             [idle] <-- server
      <address>  <--   waiting <--  |
 
-<address> work  -->  broker   -->   server
+<address> work   -->  broker   -->   server
 	                                 ....
-      response <--   broker  <--    server
+      response  <--   broker  <--    server
 
 
 Run:
