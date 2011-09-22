@@ -14,36 +14,37 @@ def test_closing_full():
     inc			= ctx.socket( zmq.XREP )
     inc.connect( "tcp://localhost:%d" % port )
 
-    # Test that ..._multipart and zmq.RCVMORE behave as we think
-    out.send_multipart( ['', 'TEST1'] )
-    msg			= inc.recv_multipart()
-    assert len( msg ) == 3    
-
-    out.send_multipart( ['', 'TEST2'] )
-    msg 		= []
-    poller		= zmq.Poller()
-    poller.register(inc, zmq.POLLIN)
-    while poller.poll( timeout=100 ):
-        msg.append( inc.recv() )
-        if not inc.getsockopt( zmq.RCVMORE ):
-            break
-    assert len( msg ) == 3
-
-    ## Add another stage; see if we can intercept and re-route between
-    ## inc/nxt
-    #port	       += 1
-    #nxt			= ctx.socket( zmq.XREQ )
-    #nxt.connect( "tcp://localhost:%d" % port )
-    #
-    #lst			= ctx.socket( zme.XREP )
-    #nxt.bind( "tcp://*:%d" % port )
-
-
-    out.close()
-    inc.close()
-    ctx.term()
-
-
+    try:
+        # Test that ..._multipart and zmq.RCVMORE behave as we think
+        out.send_multipart( ['', 'TEST1'] )
+        msg			= inc.recv_multipart()
+        assert len( msg ) == 3    
+        
+        out.send_multipart( ['', 'TEST2'] )
+        msg 		= []
+        poller		= zmq.Poller()
+        poller.register(inc, zmq.POLLIN)
+        while poller.poll( timeout=100 ):
+            msg.append( inc.recv() )
+            if not inc.getsockopt( zmq.RCVMORE ):
+                break
+        assert len( msg ) == 3
+        
+        ## Add another stage; see if we can intercept and re-route between
+        ## inc/nxt
+        #port	       += 1
+        #nxt			= ctx.socket( zmq.XREQ )
+        #nxt.connect( "tcp://localhost:%d" % port )
+        #
+        #lst			= ctx.socket( zme.XREP )
+        #nxt.bind( "tcp://*:%d" % port )
+        
+    finally:
+        out.close()
+        inc.close()
+        ctx.term()
+        
+        
 def test_sending_receiver_ids():
     """
     When multiple sockets are connected and to the same destination, are the
@@ -73,20 +74,34 @@ def test_sending_receiver_ids():
     xrepa		= ctx.socket( zmq.XREP )
     xrepa.connect( "tcp://localhost:%d" % port )
 
-    # From XREQ, XREP(B) will add a source socket ID on recv...
-    xreqa.send_multipart( [ '', 'something' ] )
-    rx			= xrepb.recv_multipart()
-    print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
-                                   for msg in rx ] )
-    assert len( rx ) == 3
+    try:
+        # From XREQ, XREP(B) will add a source socket ID on recv...
+        xreqa.send_multipart( [ '', 'something' ] )
+        rx			= xrepb.recv_multipart()
+        print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
+                                       for msg in rx ] )
+        assert len( rx ) == 3
+        
+        # Try using that socket ID as a destination for routing to the same XREP(B)
+        # from XREP(A)
+        poller = zmq.Poller()
+        poller.register( xrepb, zmq.POLLIN)
+        xrepa.send_multipart( rx )
+        socks = dict(poller.poll( timeout=1000 ))
+        # Nope.  Different IDs assigned by each connector, for the
+        # same remote socket
+        assert len( socks ) == 0
+        if socks:
+            rx2			= xrepb.recv_multipart()
 
-    # Try using that socket ID as a destination for routing to the same XREP(B)
-    # from XREP(A)
-    poller = zmq.Poller()
-    poller.register( xrepb, zmq.POLLIN)
-    xrepa.send_multipart( rx )
-    socks = dict(poller.poll( timeout=1000 ))
-    assert len( socks ) == 1
-    rx2			= xrepb.recv_multipart()
+    finally:
+        # Hmm.  On Mac, against pyzmq 2.1.9, if we don't close the
+        # sockets, python crashes; some kind of mismanagement of
+        # Python memory, probably:
+        # https://github.com/zeromq/pyzmq/issues/137
+        xrepb.close()
+        xrepa.close()
+        xreqa.close()
+        ctx.term()
 
 
