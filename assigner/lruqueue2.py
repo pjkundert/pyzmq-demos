@@ -89,9 +89,11 @@ def main():
     
     # Prepare our context and sockets
     context = zmq.Context(1)
-    frontend = context.socket(zmq.XREP)
+    #frontend = context.socket(zmq.XREP)
+    frontend = context.socket(zmq.ROUTER)
     frontend.bind(ifc_client)
-    backend = context.socket(zmq.XREP)
+    #backend = context.socket(zmq.XREP)
+    backend = context.socket(zmq.ROUTER)
     backend.bind(ifc_worker)
     
     
@@ -137,13 +139,15 @@ def main():
 
             if ZMQ_VER == 2:
                 message = backend.recv_multipart()
-                print repr(message)
+                print "%s" % ( repr( message ))
                 # Second frame is empty in 0MQ 2.1.
                 assert message[1] == ""
                 worker_addr, response = message[0:1], message[2:]
             else:
                 # 0MQ 3 -- ( ['label', ...], ['message', ...] )
-                worker_addr, response = backend.recv_multipart()
+                rx = backend.recv_multipart()
+                print "%s" % ( repr( rx ))
+                worker_addr, response = rx
 
             print "Worker:" + "-" * 32
             for p in worker_addr + [""] + response:

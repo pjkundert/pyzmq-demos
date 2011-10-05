@@ -5,6 +5,7 @@ port			= 55667
 
 def test_closing_full():
     ctx			= zmq.Context()
+    ver			= zmq.zmq_version()[:3]
 
     global port
     port	       += 1
@@ -18,7 +19,12 @@ def test_closing_full():
         # Test that ..._multipart and zmq.RCVMORE behave as we think
         out.send_multipart( ['', 'TEST1'] )
         msg			= inc.recv_multipart()
-        assert len( msg ) == 3    
+        if ver == "2.1":
+            assert len( msg ) == 3    
+        else:
+            assert isinstance( msg, tuple )
+            assert len( msg[0] ) == 1
+            assert len( msg[1] ) == 2
         
         out.send_multipart( ['', 'TEST2'] )
         msg 		= []
@@ -56,11 +62,18 @@ def test_sending_receiver_ids():
 
     if we send via an XREQ to an XREP, and we use it to send us back the ID, can
     we use this same ID to route *outwards* via the (A) XREP, *to* the same
-    destinatino XREP (B)?  Or, is a (random) ID for XREP (B) synthesiAed by each
+    destination XREP (B)?  Or, is a (random) ID for XREP (B) syntheised by each
     XREQ/XREP that connects to is (unless, of course, we sent an zmq.IDENTITY
     for XREP (B), which is obsolete in 0MQ 3+...)
+
+    Note that, under 0MQ 3+, the REQ now adds a request ID as a "LABEL" entry,
+    instead of a blank message entry.  Strictly speaking, this "maintains
+    backward compatibility" with 0MQ 2 code -- that doesn't depend on there
+    being a blank message entry, and maintains the value of the request ID label
+    entry.
     """
     ctx			= zmq.Context()
+    ver			= zmq.zmq_version()[:3]
 
     global port
     port	       += 1
@@ -77,10 +90,19 @@ def test_sending_receiver_ids():
     try:
         # From XREQ, XREP(B) will add a source socket ID on recv...
         xreqa.send_multipart( [ '', 'something' ] )
-        rx			= xrepb.recv_multipart()
-        print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
-                                       for msg in rx ] )
-        assert len( rx ) == 3
+        if ver == "2.1":
+            rx			= xrepb.recv_multipart()
+            print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
+                                           for msg in rx ] )
+            assert len( rx ) == 3
+        elif ver == "3.0":
+            labels, rx		= xrepb.recv_multipart()
+            print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
+                                           for msg in labels + rx ] )
+            assert len( labels ) == 1
+            assert len( rx ) == 2
+        else:
+            assert False and "Unknown zmq version"
         
         # Try using that socket ID as a destination for routing to the same XREP(B)
         # from XREP(A)
@@ -103,5 +125,4 @@ def test_sending_receiver_ids():
         xrepa.close()
         xreqa.close()
         ctx.term()
-
 
