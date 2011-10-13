@@ -111,15 +111,30 @@ ifeq ($(ARCH),hppa)
     CXXFLAGS	       += -mt
 endif
 
-all:			test_subs
+CXXFLAGS	+= -I.
+CXXFLAGS	+= -I../../zeromq3-0/include -I../../cut
+CXXFLAGS	+= -I../../cut
+LDFLAGS		+= -L.
+LDFLAGS		+= -L../../zeromq3-0/src/.libs
+#LDFLAGS		+= -static
+LOADLIBES	+= -lzmq -luuid -lpthread
 
-CXXFLAGS	+= -I. -I../../zeromq3-0/include -I../../cut
-LDFLAGS		+= -L. -L../../zeromq3-0/src/.libs -static
-LOADLIBES	+= -lzmq
+all:			test
+
+test:			test_main
+	./test_main
+
+# Compile and test all unit tests in a single executable.
+test_main:		test_main.C test_subs.C test_log.C
+
+# Compile and test each unit test module separately
+test-standalone:	test_subs test_log
+	./test_subs
+	./test_log
 
 test_subs:		CXXFLAGS  += -DTESTSTANDALONE
-test_subs:		LOADLIBES += -lzmq -luuid -lpthread
 test_subs:		test_subs.C
 
-test:			all
-	./test_subs
+test_log:		CXXFLAGS  += -DTESTSTANDALONE
+test_log:		test_log.C
+
