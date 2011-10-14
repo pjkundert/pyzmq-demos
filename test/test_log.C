@@ -47,6 +47,20 @@ namespace cut {
         if (rc >0)
             printf("sub sys://log received: %s\n", buff);
 
+        // 
+        char big [10000];
+        memset (big, 'A', (sizeof big) - 1);
+        big[(sizeof big) - 1] = 0;
+        rc = zmq_log (ctx, "Big: %s", big);
+        assert.ISEQUAL (rc, 0);
+
+        zmq_msg_t msg;
+        zmq_msg_init (&msg);
+        rc = zmq_recvmsg (sub, &msg, 0);
+        assert.ISEQUAL (rc, 5 + int(sizeof big));
+        assert.ISEQUAL (zmq_msg_size (&msg), 5 + (sizeof big));
+
+
         //  Clean up.
         for (int i = 0
                  ; i < socknum
