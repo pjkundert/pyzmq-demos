@@ -11,15 +11,15 @@
 #    cli--+    .       .    +--srv
 #         |    .       .    |
 #    cli--+--> o--bkr--o <--+--svr
-#         |        |        |
-#    cli--+        o        +--svr
+#         |\       |        |
+#    cli--+ +----> o        +--svr
 #                   .  
 #                    .
 #                     (control)
 #                     BRO_IFC
-#                     Control messages, eg "HALT"
-# 
-
+#                     - Session requests
+#                     - Control messages, eg "HALT"
+#                     - Read only when Server(s) are available
 import zmq
 import zhelpers
 import time
@@ -44,46 +44,48 @@ CONTEXT			= zmq.Context()
 def broker_routine( context, _ifc, back_ifc, waiting_ifc, ready_ifc ):
     """
     Establishes a fixed session between a Client and a Server, for a sequence of
-    incoming requests.  Assumes that one pool of Clients deals with a single
-    pool of Servers, via a single Broker.
+    incoming requests.  A pool of Clients deals with one or more pools of
+    Servers behind a Broker.  When a Client requests a new session, this request
+    gets passed to a broker (load balanced).
 
-    Since we cannot route "outgoing" requests via a single REQ/XREP connection
-    to all routers (only the returning replies follow routing labels), we cannot
-    connect one Client to several Routers, and have the least busy one take the
-    next request!
-
-    Well, we can -- but getting the subsequent request to go to the same Router
-    is not possible.  We would need to use a separate socket to each router to
-    transport the subsequent requests; we would use a socket shared by all
-    routers to establish the request. 
-
-
-    Therefore, we are limited to connecting all Clients to the same Router (on
-    one network interface).  The Router could, however, allow connections from
-    Servers on many hosts.  This is likely the most fruitful scaling "axis"
-    anyway, as the backend Python/Oracle requests are much heavier than the
-    frontend web HTTP request processing and page rendering.
-
-    
+    When the Broker has a Server available, it takes the Client session request
+    and passes back a key to the Client, along with an address to connect a
+    REP/XREP socket to (multiple Clients may connect to the Broker via this
+    address, to access any Servers in the pool behind this Broker).  Once
+    connected, future requests on the socket using the key will be persistently
+    routed to the assigned Server, 'til the session is terminated (or the Client
+    ceases sending keepalive requests).
 
 
-    The Server signals its readiness for a new Client with an empty request
-    (identified in 0MQ version 3+ by a server request sequence number <S#1>;
-    previous versions use an empty '' route/request seperator):
+
+    The Server signals its readiness for a new Client with an empty request ''
+    on the Broker "ready" socket.  The REQ message contains the Server's address
+    <svr> and request ID (identified in 0MQ version 3+ by a request sequence
+    number <S#1> label; previous versions use an empty '' message) seperator):
 
         Client              Router                           Server
         ------              ------                           ------
-                                                          -  ''
+                            (ready)                       -  ''
                             <svr> <S#1> ''             <-'
 
-    The Router now takes the oldest incoming Client request from the waiting
-    pool (if any).  Otherwise, the Router waits 'til a Client requests a new
-    session with a request with an empty key.  The Router assigns a Server (if
-    one is ready), sends the request, and then responds to the Client with a
-    Server session key:
+    The Broker now takes the oldest incoming Client request from the waiting
+    pool (if any).  Otherwise, the Router activates polling on the "waiting"
+    socket, and waits 'til a Client requests a new session.  The Router assigns
+    a Server (if one is ready, and responds to the Client with a Server session
+    key, and a Broker request address:
 
-        ''    <req1>    -
-                         `-> <cli> <C#1> '' <req1>
+        ''              -    (waiting)
+                         `-> <cli> <C#1> ''
+                          -  <cli> <C#1> <key> <bkr>
+        <key> <bkr>    <-'
+
+        
+    The Client now establishes a REQ/XREQ socket connection to the broker
+    address (it not already connected), and sends a series of requests using the
+    supplied key:
+
+        <key> <req1>    -    (request)
+                         `-> <cli> <C#1> <key> <req1>
                              <svr> <S#1> <req1>         -
                                                          `-> <req1>
                                                           -  <rpy1>
@@ -91,47 +93,52 @@ def broker_routine( context, _ifc, back_ifc, waiting_ifc, ready_ifc ):
                           -  <cli> <C#1> <key> <rpy1>
         <key> <rpy1>   <-'
 
-    Subsequent Client requests (including empty '' "keepalive" requests) are passed
-    through to the allocated Server:
+    Subsequent Client requests (including empty '' "keepalive" requests) are
+    passed through to the allocated Server, using the Broker's request socket.
+    If the Broker Server doesn't hear from the Client within a timeout period,
+    it assumes that the Client is dead, and abandons it (TODO: :
         
-        <key> <req2>    -
-                         `-> <cli> <C#2> <key> <req2>
-                             <svr> <S#2> <req2>         -
-                                                         `-> <req2>
-                                                          -  <rpy2>
-                             <svr> <S#3> <rpy2>        <-' 
-                          -  <cli> <C#2> <key> <rpy2>
-        <key> <rpy2>   <-'
+        <key> ''        -    (request)
+                         `-> <cli> <C#2> <key> ''
+                             <svr> <S#2> <key> ''       -
+                                                         `-> <key> ''
+                                                          -  <key> ''
+                             <svr> <S#3> ''            <-' 
+                          -  <cli> <C#2> <key> ''
+        <key> ''       <-'
 
     The Client terminates the session by providing the session key with no
-    request (note, this is different than the empty '' "keepalive" request):
+    request (note, this is different than the empty '' "keepalive" request).
+    This causes the Server to report on the Broker's ready socket, and is
+    returned to the ready pool for the next Client session request:
 
-        <key>           -
+        <key>           -    (request)
                          `-> <cli> <C#3> <key>
+                             <svr> <S#1> ''             -
+                                                         `-> <key>
+                                                          -  ''
+                             <svr> <S#2> ''            <-'
                           -  <cli> <C#3> ''
         ''             <-'
 
-    For the duration of the session, the key is expected, followed by each Client
-    request payload.  The request is routed
+                             (ready)                      -  ''
+                             <svr> <S#1> ''            <-'
 
-    A keepalive signal is expected from the Client every few seconds.  If missed,
-    the client session is 
 
-    Distributes a Client's work request to a fixedbackend Server thread, when it
-    asks for one.  Will not take an incoming work request off the
-    incoming xmq.ROUTER (XREP), until a server asks for one.  This
-    ensures that the (low) incoming High Water Mark causes the
-    upstream xmq.DEALER (XREQ) to distribute work to other brokers (if
-    they are keeping their queue clearer).
 
-    We assume that most work is quite quick (<= 1 second), with the
-    occasional really long request (seconds to hours).
 
-    Monitors the incoming frontend, which is limited to a *low* High
-    Water Mark of (say) 2, to encourage new Hits to go elsewhere when
-    all our threads are busy.  However, we'll wake up to check every
-    once in a while; if we find something waiting, we'll spool up a
-    new thread to service it.
+    Will not take an incoming work request off the incoming xmq.ROUTER (XREP),
+    until a server asks for one.  This ensures that the (low) incoming High
+    Water Mark causes the upstream xmq.DEALER (XREQ) to distribute work to other
+    brokers (if they are keeping their queue clearer).
+
+    We assume that most work is quite quick (<= 1 second), with the occasional
+    really long request (seconds to hours).
+
+    Monitors the incoming frontend, which is limited to a *low* High Water Mark
+    of (say) 2, to encourage new Hits to go elsewhere when all our threads are
+    busy.  However, we'll wake up to check every once in a while; if we find
+    something waiting, we'll spool up a new thread to service it.
 
 
     For another description of this use case, see:

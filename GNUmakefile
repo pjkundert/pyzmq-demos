@@ -31,6 +31,9 @@ zmq:			../zeromq$(ZMQVER) FORCE
 zmq-clean::		../zeromq$(ZMQVER) FORCE
 	cd $<; make -k distclean
 
+zmq-clean::		../zeromq$(ZMQVER) FORCE
+	cd $<; make clean
+
 zmq-install:		../zeromq$(ZMQVER) FORCE
 	cd $<; sudo -n make install
 
