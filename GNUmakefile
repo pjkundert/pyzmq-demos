@@ -4,11 +4,14 @@
 # Ensure you have the following packages installed:
 # 
 # zmq:
-#     apt-get -u install libtool autoconf automake uuid-dev g++
+#     sudo apt-get -u install libtool autoconf automake uuid-dev g++
 # 
 # pyzmq:
-#     
+#     sudo apt-get -u install cython python-dev
 # 
+# For building python py.test unit tests:
+#     sudo apt-get -u install python-setuptools
+#     sudo easy_install pytest
 # 
 .PHONY:			FORCE all zmq zmq-install pyzmq pyzmq-install
 
