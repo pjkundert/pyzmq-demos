@@ -5,7 +5,8 @@
 
 PY=python
 #PY=/cygdrive/c/Python27/python
-PYTEST=$(PY) -m pytest --capture=no
+#PYTEST=$(PY) -m pytest --capture=no
+PYTEST=py.test --capture=no
 
 .PHONY: all clean FORCE
 all:				
