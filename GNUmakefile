@@ -16,10 +16,10 @@ test:		../cut zmq
 	fi
 	cd $@; make test
 
+../zeromq$(ZMQVER):
+	    git clone $(ZMQURI) $@
+
 zmq:			../zeromq$(ZMQVER) FORCE
-	@if [ ! -d $< ]; then						\
-	    git clone $(ZMQURI) $<;					\
-	fi
 	@if [ ! -r $</configure ]; then					\
 	    cd $<; ./autogen.sh;					\
 	fi
@@ -40,11 +40,10 @@ zmq-install:		../zeromq$(ZMQVER) FORCE
 zmq-test:		../zeromq$(ZMQVER) FORCE
 	cd $</tests/.lib; LD_LIBRARY_PATH=
 
+../pyzmq:
+	git clone $(PYZURI) $@
 
 pyzmq:			../pyzmq zmq FORCE
-	@if [ ! -d $< ]; then						\
-	    git clone $(PYZURI) $<;					\
-	fi
 	cd $<; python setup.py configure --zmq=/usr/local
 
 pyzmq-clean:		../pyzmq FORCE
