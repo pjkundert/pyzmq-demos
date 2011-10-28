@@ -1,5 +1,15 @@
 # 
 # GNU 'make'-file for building 
+# 
+# Ensure you have the following packages installed:
+# 
+# zmq:
+#     apt-get -u install libtool autoconf automake uuid-dev g++
+# 
+# pyzmq:
+#     
+# 
+# 
 .PHONY:			FORCE all zmq zmq-install pyzmq pyzmq-install
 
 #ZMQVER 		:= 2-1
@@ -45,6 +55,7 @@ zmq-test:		../zeromq$(ZMQVER) FORCE
 
 pyzmq:			../pyzmq zmq FORCE
 	cd $<; python setup.py configure --zmq=/usr/local
+	cd $<; python setup.py build
 
 pyzmq-clean:		../pyzmq FORCE
 	cd $<; python setup.py clean
