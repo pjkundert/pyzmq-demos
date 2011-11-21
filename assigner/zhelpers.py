@@ -19,9 +19,9 @@ def dump_part(part):
 
 def format_part(part):
     if all(31 < ord(c) < 128 for c in part):
-        return part
+        return "'" + part + "'"
     else:
-        return "".join("%x" % ord(c) for c in part)
+        return "0x" + "".join("%x" % ord(c) for c in part)
 
 # Set simple random printable identity on socket
 def set_id(zsocket):
