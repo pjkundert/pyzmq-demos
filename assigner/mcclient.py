@@ -1,8 +1,13 @@
 #!/usr/bin/env python
+
+# 
 # A client for mcbroker.py
 # 
 # 
 # Obtains a session key, sends some commands, and releases the session.
+# 
+
+import json
 
 import zmq
 import mcbroker
@@ -44,6 +49,24 @@ try:
         response        = session.recv_multipart()
         print "%s Cli: Response 2: %s" % (
             mcbroker.timestamp(), repr( response ))
+
+        # Perform an RPC.  http://http://en.wikipedia.org/wiki/JSON-RPC
+
+        rpc		= {
+            'jsonrpc':	'2.0',
+            'method':	'hello',
+            'params':	[],
+            'id':	1,
+            }
+        session.send_multipart( [seskey,
+                                 'content-type: application/json',
+                                 json.dumps( rpc )] )
+
+        response	= session.recv_multipart()
+        print "%s Cli: Response JSON-RPC: %s" % (
+            mcbroker.timestamp(), repr( response ))
+        
+
     finally:
         # 3) Release the session key, by sending a 'session' request with
         # no request data (just the session key).

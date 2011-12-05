@@ -8,8 +8,10 @@ PY=python
 #PYTEST=$(PY) -m pytest --capture=no
 PYTEST=py.test --capture=no
 
+RPCURI		:= http://bzr.json-rpc.org/trunk
+
 .PHONY: all clean FORCE
-all:				
+all:		jsonrpc
 
 clean:
 	rm  *.pyc
@@ -18,6 +20,17 @@ clean:
 test:
 	@py.test --version || echo "py.test not found; run 'sudo easy_install pytest'?"
 	$(PYTEST) *_test.py
+
+
+# Make the jsonrpc module available for import
+jsonrpc:		../../json-rpc FORCE
+	@if [ ! -L $@ ]; then						\
+	    ln -fs $</python-jsonrpc/jsonrpc $@;			\
+	fi
+../../json-rpc:		FORCE
+	@if [ ! -d $@ ]; then						\
+	    bzr checkout $(RPCURI) $@;					\
+	fi
 
 # Run only tests with a prefix containing the target string, eg test-blah
 test-%:

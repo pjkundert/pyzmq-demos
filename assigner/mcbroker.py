@@ -443,6 +443,25 @@ def server_routine( context, svr_url, adm_url ):
                             ", ".join( [ zhelpers.format_part( msg )
                                          for msg in key ] ))
                         pass
+                    elif type( cmd[0] ) is str and cmd[0].endswith("application/json"):
+                        # <key> "content-type: application/json" "<JSON-RPC request>"
+                        rpcid		= None
+                        try:
+                            rpc		= json.loads( cmd[2] )
+                            assert type( rpc ) is dict, "JSON-RPC must be a dict"
+                            rpcver	= rpc.get( 'jsonrpc', rpc.get( 'version' ), 0.0 )
+                            assert float( rpcver >= 1.0 )
+                            rpcid	= rpc.get( 'id', None )
+                            pass
+                        except Exception, e:
+                            res = {
+                                'jsonrpc':	'2.0',
+                                'error':	{
+                                    'code':	-1,
+                                    'message':	str( e ),
+                                    },
+                                'id':		rpcid,
+                                }
                     else:
                         # <key> <cmd...>
                         # Work.  Just add some extra work to the command.

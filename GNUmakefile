@@ -21,6 +21,7 @@ ZMQURI		:= git://github.com/pjkundert/zeromq$(ZMQVER).git
 PYZURI		:= git://github.com/pjkundert/pyzmq.git
 CUTURI		:= git://github.com/pjkundert/cut.git
 
+
 all:			pyzmq
 
 test:		../cut zmq
@@ -30,7 +31,7 @@ test:		../cut zmq
 	cd $@; make test
 
 ../zeromq$(ZMQVER):
-	    git clone $(ZMQURI) $@
+	git clone $(ZMQURI) $@
 
 zmq:			../zeromq$(ZMQVER) FORCE
 	@if [ ! -r $</configure ]; then					\
