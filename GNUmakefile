@@ -15,9 +15,10 @@
 # 
 .PHONY:			FORCE all zmq zmq-install pyzmq pyzmq-install
 
-#ZMQVER 		:= 2-1
-ZMQVER 		:= 3-0
-ZMQURI		:= git://github.com/pjkundert/zeromq$(ZMQVER).git 
+#ZMQVER 		:= zeromq2-1
+#ZMQVER 		:= zeromq3-0
+ZMQVER 		:= libzmq
+ZMQURI		:= git://github.com/pjkundert/$(ZMQVER).git 
 PYZURI		:= git://github.com/pjkundert/pyzmq.git
 CUTURI		:= git://github.com/pjkundert/cut.git
 
@@ -30,10 +31,10 @@ test:		../cut zmq
 	fi
 	cd $@; make test
 
-../zeromq$(ZMQVER):
+../$(ZMQVER):
 	git clone $(ZMQURI) $@
 
-zmq:			../zeromq$(ZMQVER) FORCE
+zmq:			../$(ZMQVER) FORCE
 	@if [ ! -r $</configure ]; then					\
 	    cd $<; ./autogen.sh;					\
 	fi
@@ -42,16 +43,16 @@ zmq:			../zeromq$(ZMQVER) FORCE
 	fi
 	cd $<; make V=1
 
-zmq-clean::		../zeromq$(ZMQVER) FORCE
+zmq-clean::		../$(ZMQVER) FORCE
 	cd $<; make -k distclean
 
-zmq-clean::		../zeromq$(ZMQVER) FORCE
+zmq-clean::		../$(ZMQVER) FORCE
 	cd $<; make clean
 
-zmq-install:		../zeromq$(ZMQVER) FORCE
+zmq-install:		../$(ZMQVER) FORCE
 	cd $<; sudo -n make install
 
-zmq-test:		../zeromq$(ZMQVER) FORCE
+zmq-test:		../$(ZMQVER) FORCE
 	cd $</tests/.lib; LD_LIBRARY_PATH=
 
 ../pyzmq:

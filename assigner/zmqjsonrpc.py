@@ -27,6 +27,7 @@ import zmq
 import zhelpers
 import json
 
+
 VERSION                         = "2.0"
 CONTENT_TYPE                    = "content-type: application/json"
 JSON_OPTIONS                    = {
@@ -34,7 +35,7 @@ JSON_OPTIONS                    = {
     "separators":       (',', ':'),     # Most compact representation
     "allow_nan":        True,           # Allow nan/inf to be encoded
     }
-
+IS_SERVICE_METHOD		= "_is_service_method"
 
 def request_id( initial=1 ):
     """
@@ -105,10 +106,14 @@ class session_socket( object ):
         return result
 
 # 
-# The jsonrpc ServiceProxy interface, minimally modified to accept a
-# 0MQ socket, instead of a (HTTP) URL to access the service endpoint.
+# The ServiceProxy (RPC Client), and ServiceHandler (RPC
+# Server) interfaces, minimally modified to accept a 0MQ socket,
+# instead of a (HTTP) URL to access the service endpoint.
 # 
 
+# 
+# The 0MQ JSON-RPC Client interface:  
+# 
 class JSONRPCException( Exception ):
     """
     The Exception raised if an non-None 'error' is returned via the
@@ -147,22 +152,20 @@ class ServiceProxy( object ):
     required to service the keepalive heartbeat responses in a timely
     manner.
     """
-    def __init__(self, socket, serviceName=None, requestId=None):
+    def __init__(self, socket, serviceName=None, reqId=None):
         self.__socket           = socket
         self.__name             = serviceName
-        self.__reqid            = requestId if requestId is not None else request_id()
+        self.__reqid            = reqId if reqId is not None else request_id()
+
     def __getattr__( self, name ):
         if self.__name != None:
             name = "%s.%s" % (self.__name, name)
-        return ServiceProxy( self.__socket, serviceName=name, requestId=self.__reqid )
+        return ServiceProxy( self.__socket, serviceName=name, reqId=self.__reqid )
 
     def __call__( self, *args ):
         """
         Invoke the method via JSON-RPC, via the 0MQ socket, and return
         the result if successful.
-
-        All arguments are encoded and passed as Unicode, as per the
-        JSON-RPC spec.  The request id is 
         """
         method                  = unicode( self.__name )
         reqid                   = unicode( self.__reqid.next() )
@@ -189,4 +192,102 @@ class ServiceProxy( object ):
         return resp['result']
          
 
+
+# 
+# The 0MQ JSON-RPC Server interface
+# 
+def ServiceMethod( function ):
+    """
+    Decorator for functions/methods intended to be remotely accessible.
+    """
+    setattr( function, IS_SERVICE_METHOD, True )
+    return function
+
+
+def ServiceException( Exception ):
+    pass
+
+def ServiceRequestNotTranslatable( ServiceException ):
+    pass
+
+def BadServiceRequest( ServiceException ):
+    pass
+
+def ServiceMethodNotFound( ServiceException ):
+    pass
+
+
+class ServiceHandler( object ):
+    def __init__( self, service ):
+        self.__service		= service
+
+    def handleRequest( self, data ):
+        """
         
+        """
+        error			= None
+        result			= None
+        reqid			= None
+
+        try:
+            # Decode request.  May result in ValueError, KeyError,
+            # AssertionError exceptions if request is invalid.
+            try:
+                request		= json.loads( data )
+            except Exception, e:
+                raise ServiceRequestNotTranslatable(
+                    e.message + "; JSON-RPC request invalid" )
+
+            except:
+                version		= request['jsonrpc']
+                reqid		= request['id']
+                method		= request['method']
+                params		= request['params']
+                assert type( params ) is list
+            except Exception, e:
+                raise BadServiceRequest(
+                    e.message + "; JSON-RPC request bad/missing parameter" )
+
+            # Locate method.  May result in ServiceMethodNotFound exception.
+            handle		= getattr( self.service, method, None )
+            if not handle or not hasattr( handle, IS_SERVICE_METHOD ):
+                raise ServiceMethodNotFound(
+                    "%s; JSON-RPC method not %s" % (
+                        method, "allowed" if handle else "found" ))
+
+            # Invoke method, producing result.  May result in
+            # arbitrary exceptions.
+            result		= method( *params )
+        except: Exception, e:
+            error 		= {
+                "name": 	e.__class__.__name__,
+                "message":	e.message,
+                }
+
+        # At this point, either result (and reqid) OR error is set;
+        # not both.  Attempt to encode and return JSON-RPC result; on
+        # failure, fall thru and return error.
+        if not error:
+            try:
+                return json.dumps( {
+                        "id":		reqid,
+                        "result":	result,
+                        "error": 	None,
+                        } )
+            except Exception, e:
+                error		= {
+                    "name":	"JSONEncodeException",
+                    "message":	e.message + "; JSON-RPC result not serializable"
+                    }
+
+        # No result, or attempt to encode it must have failed; encode
+        # and return JSON-RPC encoded error response.
+        return json.dumps( {
+                "id":		reqid,
+                "result":	None,
+                "error": 	error,
+                })
+            
+        
+
+            
