@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# 
 # Session-oriented Request-reply service in Python
 #   
 # Expects "Hello" from client, replies with "Hello" "World" from the same Server
@@ -37,6 +38,7 @@ import zhelpers
 import time
 import threading
 import collections
+import json
 
 import time
 import timeit
@@ -81,10 +83,8 @@ def log_request( format, route, request ):
     system time to the output.
     """
     print timestamp( timer() ) + ' ' + format % (
-        ", ".join( [ zhelpers.format_part( msg )
-                     for msg in route ] ),
-        ", ".join( [ zhelpers.format_part( msg ) 
-                     for msg in request ] ))
+        ", ".join( [ zhelpers.format_part( m ) for m in route ] ),
+        ", ".join( [ zhelpers.format_part( m ) for m in request ] ))
 
 
 def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
@@ -97,11 +97,14 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
 
     When a Broker has a Server available, it takes the Client session request
     and passes back a key to the Client, along with an address to connect a
-    direct REP/XREP socket to.  Multiple Clients may connect directly to the
-    Broker via this address, to access any Servers in the pool behind this
-    Broker.  Once connected, future requests on the socket using the key will be
-    persistently routed to the assigned Server, 'til the session is terminated
-    (or the Client ceases sending keepalive requests).
+    direct REP/XREP socket to, to directly access the Broker (so all subsequent
+    requests will reach the same Broker).  Multiple Clients may connect directly
+    to this Broker via this address, to access any Servers in the pool behind
+    this Broker.  Once connected, future requests on the socket using the key
+    will be persistently routed to the assigned Server, 'til the session is
+    terminated (or the Client ceases sending keepalive requests, indicating that
+    it has died, and its Server session is terminated and the Server is returned
+    to the pool).
 
 
 
@@ -112,12 +115,12 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
     The Broker activates polling on the 'broker' socket when the 'idle' Server
     queue was empty (1 Server is now available):
 
-        tx/rx at            tx/rx at                         tx/rx at
-        Client              Router                           Server
-        ------              ------                           ------
-  t |                       (server)                      -  ''
-    v                       <svr> <S#1> ''             <-'
-                            # put Server in 'idle', start 'broker' polling
+        tx/rx at                tx/rx at                         tx/rx at
+        Client                  Router                           Server
+        ------                  ------                           ------
+  t |                           (server)                      -  ''
+    v                           <svr> <S#1> ''             <-'
+                                # put Server in 'idle', start 'broker' polling
 
     1) The Broker waits 'til a Client requests a new Session on its 'broker'
     socket.  The Broker assigns a Server (disabling polling on 'broker' socket
@@ -125,11 +128,13 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
     key (a random token created by the Broker), and a Broker session socket
     address for the Client to use for future commands using the Session:
 
-        ''              -    (broker)
-                         `-> <cli> <C#1>/''
-                             # get Server from 'idle', stop 'broker' poll if empty
-                          -  <cli> <C#1>/<key> <addr>
-        <key> <addr>   <-'
+                         broker
+                         req/xrep
+        ''                  -
+                             `-> <cli> ''
+                                 # get Server from 'idle', stop 'broker' poll if empty    
+                              -  <cli> <key> <addr>
+        <key> <addr>       <-'
 
         
     2) The Client now establishes a REQ/XREQ 'session' socket connection to the
@@ -137,14 +142,17 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
     requests using the supplied Session key, which is carried right through to
     the Server:
 
-        <key> <req1..>  -    (session)
-                         `-> <cli> <C#1>/<key> <req1..> 
-                             <svr> <S#1>/<key> <req1..> -
-                                                         `-> <key> <req1..>
-                                                          -  <key> <rpy1..>
-                             <svr> <S#2>/<key> <rpy1>   <-'
-                          -  <cli> <C#1>/<key> <rpy1..>
-        <key> <rpy1..> <-'
+                        session                          server
+                        xreq/xrep                        xrep/xreq
+
+        <C#1> <key> <req1>  -
+                             `-> <cli> <C#1> <key> <req1..> 
+                                 <svr> <S#1> <key> <req1..> -
+                                                             `-> <S#1> <key> <req1>
+                                                              -  <S#1> <key> <rpy1>
+                                 <svr> <S#2> <key> <rpy1>  <-'
+                              -  <cli> <C#1> <key> <rpy1>
+        <C#1> <key> <rpy1> <-'
 
     Subsequent Client requests on the 'session's socket (including empty ''
     "keepalive" requests) are passed through to the allocated Server, using the
@@ -153,14 +161,14 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
     (TODO: discard an outstanding Server response (if any), finish the Session
     and restore the Server to the idle pool):
         
-        <key> ''        -    (session)
-                         `-> <cli> <C#2>/<key> ''
-                             <svr> <S#2>/<key> ''       -
-                                                         `-> <key> ''
-                                                          -  <key> ''
-                             <svr> <S#3> ''            <-' 
-                          -  <cli> <C#2> <key> ''
-        <key> ''       <-'
+        <C#2> <key> ''      -
+                             `-> <cli> <C#2> <key> ''
+                                 <svr> <S#2> <key> ''       -
+                                                             `-> <key> ''
+                                                              -  <key> ''
+                                 <svr> <S#3> ''            <-' 
+                              -  <cli> <C#2> <key> ''
+        <C#2> <key> ''     <-'
 
     3) The Client terminates the session by providing the session key with no
     request (note, this is different than the empty '' "keepalive" request).
@@ -168,15 +176,16 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
     responds, for the next Client session request (enabling polling on the
     'broker' socket if 'idle' was empty):
 
-        <key>           -    (session)
-                         `-> <cli> <C#3> <key>
-                             <svr> <S#1> <key>          -
-                                                         `-> <key>
-                                                          -  <key>
-                             <svr> <S#2> <key>         <-'
-                             # return Server to 'idle', start 'broker' polling
-                          -  <cli> <C#3> <key>
-        <key>          <-'
+
+        <C#3> <key>         -
+                             `-> <cli> <C#3> <key>
+                                 <svr> <S#3> <key>          -
+                                                             `-> <S#1> <key>
+                                                              -  <S#1> <key>
+                                 <svr> <S#4> <key>         <-'
+                                 # return Server to 'idle', start 'broker' polling
+                              -  <cli> <C#3> <key>
+        <C#3> <key>        <-'
 
 
 
@@ -246,7 +255,14 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                     # Client session command; this blocks the Server -- the
                     # response it gets will be the next Client request after
                     # this Server is assigned to a session.
-                    svr, request = server.recv_multipart()
+                    msg		= server.recv_multipart()
+                    print "%s Rtr: Received [%s] from Server" % (
+                        timestamp(), ", ".join( [ zhelpers.format_part( m )
+                                                  for m in msg ] ))
+                    sep		= msg.index( '' )
+                    svr		= msg[:sep]
+                    request	= msg[sep+1:]
+
                     sesskey     = request[0]
                     sessobj     = sess.get( sesskey )
                     if sessobj and len( request ) > 1:
@@ -267,10 +283,10 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                                 timestamp())
                         cli     = sessobj.client
                         print "%s Rtr: Sending to [%s]" % ( timestamp(),
-                            ", ".join( [ zhelpers.format_part( msg )
-                                       for msg in cli ] ))
+                            ", ".join( [ zhelpers.format_part( m )
+                                         for m in cli ] ))
                         sess[sesskey] = sess_routes( client=None, server=svr )
-                        session.send_multipart( request, prefix=cli )
+                        session.send_multipart( request, prefix=cli+[''] )
                     else:
                         # Handle end session, new server; idle Server.
                         if sessobj:
@@ -283,7 +299,8 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                             del sess[sesskey]
                             print "%s Rtr: Server session %s is deleted:  %s" % (
                                 timestamp(), repr( request ), repr( sess ))
-                            session.send_multipart( request, prefix=sessobj.client )
+                            session.send_multipart( request,
+                                                    prefix=sessobj.client+[''] )
 
                         elif sesskey:
                             # <???>
@@ -314,9 +331,16 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                     # 
                     # A request with only a session key (no other request data)
                     # indicates the end of the session; 'idle' Server
-                    cli, request = session.recv_multipart()
-                    sesskey             = request[0]
-                    sessobj             = sess.get( sesskey )
+                    msg		= session.recv_multipart()
+                    print "%s Rtr: Received [%s] from Session" % (
+                        timestamp(), ", ".join( [ zhelpers.format_part( m )
+                                                  for m in msg ] ))
+                    sep		= msg.index( '' )
+                    cli		= msg[:sep]
+                    request	= msg[sep+1:]
+
+                    sesskey     = request[0]
+                    sessobj     = sess.get( sesskey )
                     if sessobj:
                         log_request( "Rtr: Session request from [%s]: [%s]",
                                      cli, request)
@@ -324,10 +348,10 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                         log_request( "Rtr: Session UNKNOWN from [%s]: [%s]",
                                      cli, request)
                         session.send_multipart( ['ERROR: invalid session key'],
-                                                prefix=cli )
+                                                prefix=cli+[''] )
                         continue
 
-                    svr                 = sessobj.server
+                    svr         = sessobj.server
                     if sessobj.client:
                         # If we detect multiple incoming client requests with
                         # the same key, before a server response is issued, the
@@ -337,13 +361,20 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                             cli, request )
                         continue
                     sess[sesskey]       = sess_routes( client=cli, server=svr )
-                    server.send_multipart( request, prefix=svr )
+                    server.send_multipart( request, prefix=svr+[''] )
 
                 elif sock == broker and status == zmq.POLLIN:
                     # Requests for new sessions arrive on the 'broker' socket.
                     # Only polled when there are available Servers; 'idle' is
                     # not empty.
-                    cli, request = broker.recv_multipart()
+                    msg		= broker.recv_multipart()
+                    print "%s Rtr: Received [%s] from Client" % (
+                        timestamp(), ", ".join( [ zhelpers.format_part( m )
+                                                  for m in msg ] ))
+                    sep		= msg.index( '' )
+                    cli		= msg[:sep]
+                    request	= msg[sep+1:]
+
                     log_request( "Rtr: Broker request: from [%s]: [%s]",
                                  cli, request )
                     if not request[0]:
@@ -358,19 +389,19 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
                         print "%s Rtr: Allocating new session from client: %r, to server: %r" % (
                             timestamp(), cli, route )
                         sesskey = route[0]   # use Server route ID as session key
-                        broker.send_multipart( [sesskey, ses_url], prefix=cli )
+                        broker.send_multipart( [sesskey, ses_url], prefix=cli+[''] )
                         sess[sesskey] = sess_routes( client=None, server=route )
                         print "%s Rtr: Sessions: %r" % ( timestamp(), sess )
                     elif request[0] == 'HALT':
                         done            = True
-                        broker.send_multipart( [''], prefix=cli )
+                        broker.send_multipart( [''], prefix=cli+[''] )
                     elif request[0] == 'REPORT':
                         admin.send_multipart( ['REPORT'] )
-                        broker.send_multipart( [''], prefix=cli )
+                        broker.send_multipart( [''], prefix=cli+[''] )
                     else:
                         # Not a recognized broker request!
                         print "%s Rtr: Unrecognized request!" % ( timestamp() )
-                        broker.send_multipart( [''], prefix=cli )
+                        broker.send_multipart( [''], prefix=cli+[''] )
                 else:
                     print "%s Rtr: Unrecognized poll status: %s" % (
                         timestamp(), repr( status ))
@@ -380,8 +411,8 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
         # Servers in the idle list or allocated to a session, to awaken them
         # (they are blocked, awaiting incoming commands on their work sockets)
         admin.send_multipart( ['HALT'] )
-        for route in idle + [ s.server for s in sess ]:
-            server.send_multipart( [''], prefix=route )
+        for route in idle + [ s.server for s in sess.values() ]:
+            server.send_multipart( [''], prefix=route+[''] )
         broker.close()
         session.close()
         server.close()
@@ -412,6 +443,12 @@ def server_routine( context, svr_url, adm_url ):
     # be the first Client request; it will *always* contain a Session key and
     # this key must be used in the subsequent request (which actually carries
     # the reply to the Client.)
+    # 
+    # zmq.REQ automatically sends a '' separator prefix, so that the routing
+    # information can be separated from the message.  The Broker also
+    # (explicitly) does so using its zmq.XREP, but all the routing information
+    # and the separator is stripped off by zmq.REQ, so we'll just receive the
+    # message.
     print "%s Svr: %s: Ready" % ( timestamp(), tid )
     wrk.send_multipart( [''] )
 
@@ -430,8 +467,8 @@ def server_routine( context, svr_url, adm_url ):
                     # We have received a work unit; if it is empty, it's a ping.
                     print "%s Svr: Thread %s received request: [%s]" % (
                         timestamp(), tid,
-                        ", ".join( [ zhelpers.format_part( msg )
-                                     for msg in request ] ))
+                        ", ".join( [ zhelpers.format_part( m )
+                                     for m in request ] ))
                     key = request[:1]
                     cmd = request[1:]
                     res = []
@@ -440,8 +477,8 @@ def server_routine( context, svr_url, adm_url ):
                         # End of Session; no command.  Just return key.
                         print "%s Svr: Thread %s end of session [%s]" % (
                             timestamp(), tid,
-                            ", ".join( [ zhelpers.format_part( msg )
-                                         for msg in key ] ))
+                            ", ".join( [ zhelpers.format_part( m )
+                                         for m in key ] ))
                         pass
                     elif type( cmd[0] ) is str and cmd[0].endswith("application/json"):
                         # <key> "content-type: application/json" "<JSON-RPC request>"
@@ -454,23 +491,23 @@ def server_routine( context, svr_url, adm_url ):
                             rpcid	= rpc.get( 'id', None )
                             pass
                         except Exception, e:
-                            res = {
+                            res = [ json.dumps( {
                                 'jsonrpc':	'2.0',
                                 'error':	{
                                     'code':	-1,
                                     'message':	str( e ),
                                     },
                                 'id':		rpcid,
-                                }
+                                } ) ]
                     else:
                         # <key> <cmd...>
                         # Work.  Just add some extra work to the command.
                         print "%s Svr: Thread %s cmd on session [%s]: [%s]" % (
                             timestamp(), tid,
-                            ", ".join( [ zhelpers.format_part( msg )
-                                         for msg in key ] ),
-                            ", ".join( [ zhelpers.format_part( msg )
-                                         for msg in cmd ] ))
+                            ", ".join( [ zhelpers.format_part( m )
+                                         for m in key ] ),
+                            ", ".join( [ zhelpers.format_part( m )
+                                         for m in cmd ] ))
 
                         time.sleep( 1 )
                         res += cmd + [ 'World' ]
@@ -481,8 +518,8 @@ def server_routine( context, svr_url, adm_url ):
                     multipart   = adm.recv_multipart()
                     print "%s Svr: %s received admin: [%s]" % (
                         timestamp(), tid, 
-                        ", ".join( [ zhelpers.format_part( msg )
-                                     for msg in multipart ] ))
+                        ", ".join( [ zhelpers.format_part( m )
+                                     for m in multipart ] ))
                     if multipart[0] == 'HALT':
                         done = True
                     elif multipart[0] == 'REPORT':
@@ -532,7 +569,7 @@ if __name__ == "__main__":
     try:
         signal.pause()
     finally:
-        broker.send_multipart( ['HALT'] )
+        broker.send_multipart( ['HALT'], prefix=[''] )
         broker.recv_multipart()
         for t in threads:
             t.join()

@@ -19,12 +19,14 @@ def test_closing_full():
         # Test that ..._multipart and zmq.RCVMORE behave as we think
         out.send_multipart( ['', 'TEST1'] )
         msg			= inc.recv_multipart()
-        if ver == "2.1":
+        if ver in ("2.1", "3.1"):
             assert len( msg ) == 3    
-        else:
+        elif ver in ("3.0"):
             assert isinstance( msg, tuple )
             assert len( msg[0] ) == 1
             assert len( msg[1] ) == 2
+        else:
+            assert False and "Unknown zmq version"
         
         out.send_multipart( ['', 'TEST2'] )
         msg 		= []
@@ -90,12 +92,12 @@ def test_sending_receiver_ids():
     try:
         # From XREQ, XREP(B) will add a source socket ID on recv...
         xreqa.send_multipart( [ '', 'something' ] )
-        if ver == "2.1":
+        if ver in ("2.1", "3.1"):
             rx			= xrepb.recv_multipart()
             print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
                                            for msg in rx ] )
             assert len( rx ) == 3
-        elif ver == "3.0":
+        elif ver in ("3.0"):
             labels, rx		= xrepb.recv_multipart()
             print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
                                            for msg in labels + rx ] )
