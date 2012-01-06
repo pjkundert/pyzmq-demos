@@ -419,7 +419,7 @@ def mcbroker_routine( context, ses_url, bro_ifc, ses_ifc, svr_ifc, adm_ifc ):
         admin.close()
     print "%s Rtr: exiting" % timestamp()
 
-def server_routine( context, svr_url, adm_url ):
+def server_routine( context, svr_url, adm_url, server ):
     """
     Server thread 'wrk' socket has a unique ID, which the router will need to
     know, in order to arrange for messages to be forwarded to it.  Send a
@@ -429,6 +429,9 @@ def server_routine( context, svr_url, adm_url ):
 
     The 'adm' SUB socket is used to transmit administrative directions to the
     server (eg. 'HALT')
+
+
+    The 'server' object is acted upon by any remote JSON-RPC requests.
     """
     tid                 = threading.current_thread().ident
 
@@ -480,25 +483,30 @@ def server_routine( context, svr_url, adm_url ):
                             ", ".join( [ zhelpers.format_part( m )
                                          for m in key ] ))
                         pass
-                    elif type( cmd[0] ) is str and cmd[0].endswith("application/json"):
+                    elif type( cmd[0] ) is str and cmd[0].lower().endswith("application/json"):
                         # <key> "content-type: application/json" "<JSON-RPC request>"
                         rpcid		= None
                         try:
-                            rpc		= json.loads( cmd[2] )
+                            rpc		= json.loads( cmd[1] )
                             assert type( rpc ) is dict, "JSON-RPC must be a dict"
-                            rpcver	= rpc.get( 'jsonrpc', rpc.get( 'version' ), 0.0 )
+                            rpcver	= rpc.get( 'jsonrpc', rpc.get( 'version', 0.0 ))
                             assert float( rpcver >= 1.0 )
                             rpcid	= rpc.get( 'id', None )
-                            pass
+
+                            res 	= [
+                                json.dumps(
+                                    getattr( server, rpc.get( 'method' ))(
+                                        *rpc.get( 'params' ))) ]
+
                         except Exception, e:
                             res = [ json.dumps( {
-                                'jsonrpc':	'2.0',
-                                'error':	{
-                                    'code':	-1,
-                                    'message':	str( e ),
-                                    },
-                                'id':		rpcid,
-                                } ) ]
+                                        'jsonrpc':	'2.0',
+                                        'error':	{
+                                            'code':	-1,
+                                            'message':	str( e ),
+                                            },
+                                        'id':		rpcid,
+                                        } ) ]
                     else:
                         # <key> <cmd...>
                         # Work.  Just add some extra work to the command.
@@ -545,10 +553,15 @@ def demo_broker_servers( context, servers=5 ):
     t.start()
     threads.append( t )
 
+    class server_target( object ):
+        def hello( self ):
+            return "JSON World %s" % repr( self )
+
     for i in range( servers ):
         t               = threading.Thread( target=server_routine,
                                             args=( context,
-                                                   SVR_URL, ADM_URL ))
+                                                   SVR_URL, ADM_URL,
+                                                   server_target() ))
         t.start()
         threads.append( t )
 
