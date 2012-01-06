@@ -1,9 +1,9 @@
 # 
-# pyzmq-jsonrpc.py
+# zmqjsonrpc.py
 # 
 # A JSON-RPC Service Proxy interface using 0MQ for transport
 # 
-# Based on the reference Python JSON-PRC implementation from
+#     Based on the reference Python JSON-PRC implementation from
 # http://json-rpc.org Presents an interface similar to (close to
 # plug-in compatible with) json-rpc.
 #
@@ -15,13 +15,104 @@
 #          <proxy>.method(<params>)
 # 
 #     Sends the 0MQ 2-part message: 'content-type: application/json',
-#     followed by a JSON-RPC 2.0 encoded remote method invocation of:
+# followed by a JSON-RPC 2.0 encoded remote method invocation of:
 #     
 #          [serviceName.]method(<params>)
 # 
 #     The result (or exception, raised as a JSONRPCException) is
-#     returned via JSON-RPC encoding.
+# returned via JSON-RPC encoding.
 # 
+# 0MQ JSON-RPC Protocol
+# 
+#     The zmqjsonrpc's ServiceProxy expects a zmq.REQ/REP type socket,
+# where .recv_multipart yields exactly the original list passed to
+# .send_multipart:
+# 
+#         Client                           Server
+#         zmq.REQ                          zmq.REP
+#         -------                          ------
+#         '{"jsonrpc"...}'            -
+#                                      `-> '{"jsonrpc"...}'
+#                                       -  '{"result"...}'
+#         '{"result"...}'            <-'
+# 
+# This simple 0MQ REQ/REP socket pair can support simple, traditional
+# 1:1 RPC.  
+# 
+# 
+#     For other zmq socket types, 0MQ adds additional routing
+# information, which must be handled:
+# 
+#         zmq.REQ                          zmq.XREP
+#         -------                          ------
+#         '{"jsonrpc"...}'            -
+#                                      `-> <cli> '' '{"jsonrpc"...}'
+#                                       -  <cli> '' '{"result"...}'
+#         '{"result"...}'            <-'
+# 
+# This supports an M:1 RPC scenario, where multiple clients make
+# requests to a single server, and each request must supply the
+# routing information to carry the corresponding reply back to the
+# correct client.
+# 
+# 
+#     There may be reason to add yet further data to the messages
+# transmitted over the socket's stream; to assist in establishing
+# sessions (eg. if the destination socket is shared by multiple
+# separate sessions within the same client):
+# 
+#         zmq.REQ                          zmq.XREP
+#         -------                          ------
+#         <s#1> '{"jsonrpc"...}'      -
+#                                      `-> <cli> '' <s#1> '{"jsonrpc"...}'
+#                                       -  <cli> '' <s#1> '{"result"...}'
+#         <s#1> '{"result"...}'      <-'
+# 
+# Now, an X*M:1 scenario is supported, where X sessions (threads?), in
+# each of M clients, can send RPC requests to 1 server, and the
+# results are sent back to the correct client, and then to the correct
+# session/thread within the client.  This also supports simple X*M:N
+# RPC, if the client connects its zmq.REQ socket to multiple server
+# zmq.XREP sockets; however.  Each request would be routed to a random
+# server, which is satisfactory for many applications.
+# 
+# 
+#     To support a more strict X*M:N scenario (multiple
+# sessions/client, multiple clients, and multiple servers) with strict
+# session/server allocation, another layer is required.  The Client
+# must request a server, using a 1:N channel (eg. REQ/REP, where the
+# client REQ binds, and all the server REPs connect, or where the
+# client REQ connects to each of the multiple server REP socket bind
+# addresses).  The client then obtains a session ID and socket address:
+# 
+#         zmq.REQ                          zmq.XREP
+#         -------                          ------
+#         ''                          -
+#                                      `-> <cli> '' ''
+#                                       -  <cli> '' <key> <addr>
+#         <key> <addr>               <-'
+# 
+# The client then creates a new zmq.REQ socket to the address (if not
+# already existing), and then uses it to perform X*M:1 RPC
+# 
+#         zmq.REQ                          zmq.XREP
+#         -------                          ------
+#         <key> '{"jsonrpc"...}'      -
+#                                      `-> <cli> '' <key> '{"jsonrpc"...}'
+#                                       -  <cli> '' <key> '{"result"...}'
+#         <key> '{"result"...}'      <-'
+# 
+# The end of the session is denoted with an empty request:
+# 
+#         <key>                       -
+#                                      `-> <cli> '' <key>
+#                                       -  <cli> '' <key>
+#         <key>                      <-'
+# 
+# allowing the server to return the session's resources (eg. thread)
+# to the pool.
+# 
+
 
 import zmq
 import zhelpers
@@ -51,9 +142,9 @@ def request_id( initial=1 ):
 
 class session_socket( object ):
     """
-    Transparently supports session ID lists and/or 0MQ routing prefix
-    lists, while presenting the basic 0MQ send_/recv_multipart
-    interface.
+    Transparently supports session ID lists and/or 0MQ routing
+    prefixes on transported 0MQ message lists, while presenting the
+    basic 0MQ send_/recv_multipart interface.
 
     Encapsulates a zmq.XREQ or zmq.XREP socket endpoint,
     adding/stripping optional session ID and/or routing label prefix
@@ -238,7 +329,7 @@ class ServiceHandler( object ):
                 raise ServiceRequestNotTranslatable(
                     e.message + "; JSON-RPC request invalid" )
 
-            except:
+            try:
                 version		= request['jsonrpc']
                 reqid		= request['id']
                 method		= request['method']
@@ -258,7 +349,7 @@ class ServiceHandler( object ):
             # Invoke method, producing result.  May result in
             # arbitrary exceptions.
             result		= method( *params )
-        except: Exception, e:
+        except Exception, e:
             error 		= {
                 "name": 	e.__class__.__name__,
                 "message":	e.message,
