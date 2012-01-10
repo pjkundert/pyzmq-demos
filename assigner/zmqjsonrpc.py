@@ -166,35 +166,48 @@ class session_socket( object ):
         assert type( data ) is list
         payload                 = self.__sessid + data
         print "Sending (to %s): %s" % (
-            ", ".join( [ zhelpers.format_part( lbl )
-                         for lbl in prefix ] ),
-            ", ".join( [ zhelpers.format_part( msg )
-                         for msg in payload ] ))
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in prefix ] ),
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in payload ] ))
         self.__socket.send_multipart( payload, prefix=prefix )
 
     def recv_multipart( self ):
         """
-        Removes any leading session id from the result; fails if no
-        session id is present.
+        Removes any leading prefix or session id from the result; fails if no
+        session id is present.  If a __prefix is specified, then we expect that
+        prefix on messages received; the message must contain a '' separator.
         """
-        result                  = self.__socket.recv_multipart()
-        if type( result ) is tuple:
-            prefix, payload     = result
+        receive                 = self.__socket.recv_multipart()
+        if self.__prefix:
+            sep			= receive.index( '' )
+            prefix              = receive[:sep]
+            payload             = receive[sep+1:]
         else:
-            prefix              = []
-            payload             = result
+            prefix		= []
+            payload		= receive
+        if prefix and prefix != self.__prefix:
+            raise Exception( "Expected routing prefix: [%s], received [%s]" % (
+                    ", ".join(  [ zhelpers.format_part( m )
+                                  for m in self.__prefix ] ),
+                    ", ".join(  [ zhelpers.format_part( m )
+                                  for m in prefix ] )))
+            
         print "Receive (fr %s): %s" % (
-            ", ".join( [ zhelpers.format_part( lbl )
-                         for lbl in prefix ] ),
-            ", ".join( [ zhelpers.format_part( msg)
-                         for msg in payload ] ))
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in prefix ] ),
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in payload ] ))
         if self.__sessid:
-            if result[:len(self.__sessid)] == self.__sessid:
-                result          = result[len(self.__sessid):]
+            if payload[:len(self.__sessid)] == self.__sessid:
+                payload          = payload[len(self.__sessid):]
             else:
-                raise Exception( "Expected session ID: %s" % (
-                        ", ".join( self.__sessid )))
-        return result
+                raise Exception( "Expected session ID: [%s], received [%s]" % (
+                    ", ".join(  [ zhelpers.format_part( m )
+                                  for m in self.__sessid ] ),
+                    ", ".join(  [ zhelpers.format_part( m )
+                                  for m in payload[:len(self.__sessid)]] )))
+        return payload
 
 # 
 # The ServiceProxy (RPC Client), and ServiceHandler (RPC

@@ -14,14 +14,14 @@ def test_zmqrpc_simulate_server():
 
     # Simulate the Server side of the 0MQ JSON-RPC request
     def svrfun():
-        prefix, request         = svr.recv_multipart()
-        assert len( prefix ) == 1
-        assert len( request ) == 3
-        assert request[0].lower() == "1"     # Session ID
-        assert request[1].lower() == zmqjsonrpc.CONTENT_TYPE
-        sessid                  = request[0]
+        request         	= svr.recv_multipart()
+        assert len( request ) == 4
+        assert request[1].lower() == "1"     # Session ID
+        assert request[2].lower() == zmqjsonrpc.CONTENT_TYPE
+        prefix			= request[:1]
+        sessid                  = request[1]
 
-        requestdict             = json.loads( request[2] )
+        requestdict             = json.loads( request[3] )
         assert requestdict['method'] == "boo.foo"
         assert len( requestdict['params'] ) == 3
 
