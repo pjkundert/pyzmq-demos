@@ -3,15 +3,21 @@ import zmqjsonrpc
 import zhelpers
 import json
 import threading
+import time
 
-def test_zmqrpc_simulate_server():
+port				= 11223
+
+
+def test_simulate_server():
+    global port
+    port 		       += 1
     clictx                      = zmq.Context()
     cli                         = clictx.socket( zmq.REQ )
-    cli.connect( 'tcp://localhost:11223' )
+    cli.connect( "tcp://localhost:%d" % ( port ))
 
     svrctx                      = zmq.Context()
     svr                         = svrctx.socket( zmq.XREP )
-    svr.bind( 'tcp://*:11223' )
+    svr.bind( "tcp://*:%d" % ( port ))
 
     # Simulate the Server side of the 0MQ JSON-RPC request, receiving
     # and processing the raw 0MQ request.
@@ -64,3 +70,80 @@ def test_zmqrpc_simulate_server():
     cli.close()
     clictx.term()
 
+class stoppable( threading.Thread ):
+    """
+    Supports external thread-safe Thread stop signalling.
+    """
+    def __init__( self, *args, **kwargs ):
+        super( stoppable, self ).__init__( *args, **kwargs )
+        self.__stop	 	= threading.Event()
+
+    def stop( self ):
+        self.__stop.set()
+
+    def stopped( self ):
+        return self.__stop.is_set()
+
+    def join( self, *args, **kwargs ):
+        self.stop()
+        super( stoppable, self ).join( *args, **kwargs )
+
+
+class zmqwrapper( stoppable ):
+    """
+    Handle incoming traffic on a supplied socket, 'til stopped.  Assumes that
+    the 0MQ socket has a timeout, if caller expects run to check stopped with
+    any regularity.
+    """
+    def __init__( self, socket, handler, *args, **kwargs ):
+        super( zmqwrapper, self ).__init__( *args, **kwargs )
+        self.__socket		= socket
+        self.__handler		= handler
+
+    def run( self ):
+        while not self.stopped():
+            request		= self.__socket.recv_multipart()
+            if request:
+                print "Request: [%s]" % (
+                    ", ".join(  [ zhelpers.format_part( m )
+                                  for m in request ] ))
+                self.__handler.handleRequest( request )
+
+
+class boo( object ):
+    def foo( *args ):
+        return ", ".join( str( a ) for a in args )
+
+def test_simplest():
+    global port
+    handler			= zmqjsonrpc.ServiceHandler( service=boo() )
+    result			= handler.handleRequest(
+        '{"params":[1,2,3],"jsonrpc":"2.0","method":"boo.foo","id":"1"}' )
+    assert result == "1, 2, 3"
+
+    port 		       += 1
+    clictx                      = zmq.Context()
+    cli                         = clictx.socket( zmq.REQ )
+    cli.connect( "tcp://localhost:%d" % ( port ))
+    svrctx                      = zmq.Context()
+    svr                         = svrctx.socket( zmq.REP )
+    svr.setsockopt( zmq.RCVTIMEO, 250 )
+    svr.bind( "tcp://*:%d" % ( port ))
+
+    cli.send_multipart( [ "hi" ] )
+    assert svr.recv_multipart()  == [ "hi" ]
+    svr.send_multipart( [ "lo" ] )
+    assert cli.recv_multipart() == [ "lo" ]
+
+    svrthr                      = zmqwrapper( socket=svr, handler=handler )
+    svrthr.daemon		= True
+    svrthr.start()
+
+    pxy                         = zmqjsonrpc.ServiceProxy(
+                                      socket=cli,
+                                      serviceName="boo" )
+    result                      = pxy.foo( 1, 2, 3 )
+    assert result == "1, 2, 3"
+    del pxy
+
+    svrthr.join()

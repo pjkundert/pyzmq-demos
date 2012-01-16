@@ -36,8 +36,8 @@
 #                                       -  '{"result"...}'
 #         '{"result"...}'            <-'
 # 
-# This simple 0MQ REQ/REP socket pair can support simple, traditional
-# 1:1 RPC.  
+# This simple 0MQ REQ/REP socket pair can support simple, traditional 1:1 RPC.
+# As expected, it is the simplest to set up and use.
 # 
 # 
 #     For other zmq socket types, 0MQ adds additional routing
@@ -117,6 +117,7 @@
 import zmq
 import zhelpers
 import json
+import traceback
 
 
 VERSION                         = "2.0"
@@ -281,12 +282,12 @@ class ServiceProxy( object ):
                                       }, **JSON_OPTIONS )
         self.__socket.send_multipart( [CONTENT_TYPE, data] )
 
-        # Receive and decode JSON response data.  May raise
-        # ValueError, etc. exception, if not valid JSON.  Will raise
-        # AttributeError exceptions if response dict doesn't contain
-        # required 'error', 'result', 'id' fields, and AssertionError
-        # if values are not as expected.  See jsonrpc/proxy.py for
-        # reference implementation.
+        # Receive and decode JSON response data.  May raise ValueError,
+        # etc. exception, if not valid JSON.  Will raise AttributeError
+        # exceptions if response dict doesn't contain required 'error',
+        # 'result', 'id' fields, and AssertionError if values are not as
+        # expected.  See jsonrpc/proxy.py for reference implementation.
+        # Handle restarts
         respdata                = self.__socket.recv_multipart()
         resp                    = json.loads( respdata[0] )
         assert resp['id'] == reqid, \
@@ -325,6 +326,12 @@ class ServiceHandler( object ):
     def __init__( self, service ):
         self.__service		= service
 
+    def trap_exception( self, exc ):
+        """
+        An exception has occured; trap, log, etc. any of the exception data here, if desired.
+        """
+        pass
+
     def handleRequest( self, data ):
         """
         
@@ -340,7 +347,7 @@ class ServiceHandler( object ):
                 request		= json.loads( data )
             except Exception, e:
                 raise ServiceRequestNotTranslatable(
-                    e.message + "; JSON-RPC request invalid" )
+                    str(e) + "; JSON-RPC request invalid" )
 
             try:
                 version		= request['jsonrpc']
@@ -350,10 +357,10 @@ class ServiceHandler( object ):
                 assert type( params ) is list
             except Exception, e:
                 raise BadServiceRequest(
-                    e.message + "; JSON-RPC request bad/missing parameter" )
+                    str(e) + "; JSON-RPC request bad/missing parameter" )
 
             # Locate method.  May result in ServiceMethodNotFound exception.
-            handle		= getattr( self.service, method, None )
+            handle		= getattr( self.__service, method, None )
             if not handle or not hasattr( handle, IS_SERVICE_METHOD ):
                 raise ServiceMethodNotFound(
                     "%s; JSON-RPC method not %s" % (
@@ -363,14 +370,26 @@ class ServiceHandler( object ):
             # arbitrary exceptions.
             result		= method( *params )
         except Exception, e:
+            # Exception encountered while unmarshalling parameters or invoking
+            # target method.  Capture all exception detail, including the args
+            # (if they can be encoded)
+            exc_type		= "%s.%s" % ( type(e).__module, type(e).__name )
+            exc_mesg		= traceback.format_exception_only( type(e), e )[-1].strip()
             error 		= {
-                "name": 	e.__class__.__name__,
-                "message":	e.message,
+                "name": 	exc_type,
+                "message":	exc_mesg,
                 }
+            try:
+                json.encode({'args': exc.args})
+            except TypeErorr:
+                pass
+            else:
+                error["args"]	= e.args
 
-        # At this point, either result (and reqid) OR error is set;
-        # not both.  Attempt to encode and return JSON-RPC result; on
-        # failure, fall thru and return error.
+
+        # At this point, either result (and reqid) OR error is set; not both.
+        # Attempt to encode and return JSON-RPC result; on failure, fall thru
+        # and return error.
         if not error:
             try:
                 return json.dumps( {
@@ -381,7 +400,7 @@ class ServiceHandler( object ):
             except Exception, e:
                 error		= {
                     "name":	"JSONEncodeException",
-                    "message":	e.message + "; JSON-RPC result not serializable"
+                    "message":	str(e) + "; JSON-RPC result not serializable"
                     }
 
         # No result, or attempt to encode it must have failed; encode
