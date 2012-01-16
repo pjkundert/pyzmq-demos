@@ -8,6 +8,98 @@ import time
 port				= 11223
 
 
+class stoppable( threading.Thread ):
+    """
+    Supports external thread-safe Thread stop signalling.
+    """
+    def __init__( self, *args, **kwargs ):
+        super( stoppable, self ).__init__( *args, **kwargs )
+        self.__stop	 	= threading.Event()
+
+    def stop( self ):
+        self.__stop.set()
+
+    def stopped( self ):
+        return self.__stop.is_set()
+
+    def join( self, *args, **kwargs ):
+        self.stop()
+        super( stoppable, self ).join( *args, **kwargs )
+
+
+class server_thread( stoppable ):
+    def __init__( self, socket ):
+        self._socket		= socket
+        super( server_thread, self ).__init__()
+
+    def run( self ):
+        while not self.stopped():
+            request         	= self._socket.recv_multipart()
+            if not request:
+                continue
+            print "Server rx. [%s]" % (
+                ", ".join( [ zhelpers.format_part( m )
+                         for m in request ] ))
+            assert len( request ) == 3
+            assert request[1] == ""	   	     # Route prefix separator
+            prefix		= request[:2]
+            requestdict         = json.loads( request[2] )
+            assert requestdict['method'].startswith( "boo." )
+            
+            result              = ", ".join( [ str( p )
+                                               for p in requestdict['params']] )
+            
+            replydict           = {
+                "jsonrpc":          requestdict['jsonrpc'],
+                "id":               requestdict['id'],
+                "result":           result,
+                "error":            None,
+                }
+            reply	       	= [json.dumps( replydict,
+                                               **zmqjsonrpc.JSON_OPTIONS)]
+            
+            print "Server tx. [%s]" % (
+                ", ".join( [ zhelpers.format_part( m )
+                             for m in prefix + reply ] ))
+            
+            self._socket.send_multipart( reply, prefix=prefix )
+
+
+def test_base_client():
+
+    global port
+    port		       += 1
+    
+    
+    # Create 0MQ transport
+    context			= zmq.Context()
+    socket			= context.socket( zmq.REQ )
+    remote			= zmqjsonrpc.client( socket=socket, name="boo" )
+
+    # Create the test server and connect client to it
+    svr				= context.socket( zmq.XREP )
+    svr.setsockopt( zmq.RCVTIMEO, 250 )
+    svr.bind( "tcp://*:%d" % ( port ))
+    socket.connect( "tcp://localhost:%d" % ( port ))
+
+    svrthr                      = server_thread( socket=svr )
+    svrthr.start()
+
+    # Create callable to method "first" and invoke; then "second"
+    result1			= remote.first( "some", "args" )
+    assert result1 == "some, args"
+    result2			= remote.second( "yet", "others" )
+    assert result2 == "yet, others"
+    done			= True
+
+    svrthr.join()
+    svr.close()
+
+    # Clean up; destroy proxy, then close sockets, terminate context
+    del remote
+    socket.close()
+    context.term()
+
 def test_simulate_server():
     global port
     port 		       += 1
@@ -69,25 +161,6 @@ def test_simulate_server():
     svrctx.term()
     cli.close()
     clictx.term()
-
-class stoppable( threading.Thread ):
-    """
-    Supports external thread-safe Thread stop signalling.
-    """
-    def __init__( self, *args, **kwargs ):
-        super( stoppable, self ).__init__( *args, **kwargs )
-        self.__stop	 	= threading.Event()
-
-    def stop( self ):
-        self.__stop.set()
-
-    def stopped( self ):
-        return self.__stop.is_set()
-
-    def join( self, *args, **kwargs ):
-        self.stop()
-        super( stoppable, self ).join( *args, **kwargs )
-
 
 class zmqwrapper( stoppable ):
     """

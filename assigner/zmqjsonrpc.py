@@ -1,12 +1,84 @@
 # 
 # zmqjsonrpc.py
 # 
-# A JSON-RPC Service Proxy interface using 0MQ for transport
+#     An RPC framework using some JSON-RPC standards, using 0MQ for transport
 # 
-#     Based on the reference Python JSON-PRC implementation from
-# http://json-rpc.org Presents an interface similar to (close to
-# plug-in compatible with) json-rpc.
-#
+#     Originally intended to be based on the reference Python JSON-PRC
+# implementation from http://json-rpc.org, but instead provides some basic
+# functionality for implementing RPC-like client proxies and servers.  Not close
+# to plug-in compatible with json-rpc.
+# 
+#     The problem with 0MQ is that it is not connection oriented in the
+# traditional TCP/IP or even UDP/IP sense; with some configuration changes, 0 or
+# more client 0MQ REQ sockets may be connected to 0 or more server 0MQ REP
+# sockets, with our without intervening 0MQ router/dealer brokers in between.
+# Furthermore, there is no notification when clients and/or servers appear or
+# disappear, making some traditional RPC requirements (eg. failure on connection
+# disappearance) possible.  Basically, as the 0MQ designers say "RPC is a leaky
+# abstraction".  
+# 
+#     You may *believe* that an interface using a network connected RPC
+# interface is "just like" your original in-process procedure call based
+# implementation -- but it is *not*, in very serious ways, which you *must*
+# handle, by design.  (eg. timing, failure modes, session <-> thread assignment,
+# etc., etc.)
+# 
+#     So, instead of providing a transparent, proxy-based RPC interface built on
+# 0MQ, we'll implement several useful features which you can use to implement
+# robust and performant remote communications using 0MQ, which you may embed in
+# a method-call based interface wrapper, if you wish.
+# 
+#     Some of the capabilities:
+# 
+# o Support multiple clients, connecting to multiple servers.
+# 
+#     If multiple addresses are configured, then each client will explicitly
+#     connect its request port to all of them.  Each request will be received
+#     and processed by an arbitrary server, in a round-robin fashion.  0MQ will
+#     route the request back to the correct client.
+# 
+# o Detect server liveness sending (and responding to) pings on server socket
+# 
+#     The main server request socket may be used for RPC calls, pings and to
+#     request session keys.  If a server ceases to respond to pings (or ceases
+#     to send ping requests), then it is declared dead.  In additions, all
+#     outstanding RPC requests using sessions allocated by server are also
+#     abandoned.
+# 
+# o Supports return of arbitrarily large values as a stream of blocks.
+# 
+#     Instead of collecting the complete result, and attempting to marshall,
+#     transport and unmarshall it, the API may serially collect blocks of data
+#     and transport them, while the client either collects them up and returns
+#     them, or processes them in a streaming manner if more appropriate.
+# 
+# o Exceptions in the server may be handled arbitrarily on the server side 
+# 
+#     May be logged, or details stored for later access, or simplified and
+#     returned (exception call-stack detail discarded)
+# 
+# o Session oriented protocols
+# 
+#     A series of invocations may need to be processed in order by the same
+#     remote server thread.  Supports the acquisition of a server and allocation
+#     of a session key, and creation of a separate channel to that server for
+#     processing of subsequent requests within that session.  This allows all
+#     requests to hit the same server, and allows that server to ensure that the
+#     same thread processes all requests with that session key.
+# 
+# o Broadcast requests
+# 
+#     It is sometimes necessary to collect a response from all servers; for
+#     example, to collect statistics or update some server state globally across
+#     all instances.  Means are provided to send requests to all available
+#     servers, and collect responses from all of them, blocking 'til the last
+#     (surviving) one responds.
+#     
+#   - Enumerate all available servers (from original server address list)
+#   - Send requests to each
+#   - Block on all servers, while sending/receiving pings to ensure liveness
+# 
+# 
 # ServiceProxy( socket[, serviceName[, requestId )
 # 
 #     Creates a proxy for the named object (optional; default None
@@ -24,42 +96,48 @@
 # 
 # 0MQ JSON-RPC Protocol
 # 
-#     The zmqjsonrpc's ServiceProxy expects a zmq.REQ/REP type socket,
-# where .recv_multipart yields exactly the original list passed to
-# .send_multipart:
+#     The zmqjsonrpc's ServiceProxy expects a zmq.REQ/REP type socket, where
+# .recv_multipart yields exactly the original list passed to .send_multipart:
 # 
 #         Client                           Server
 #         zmq.REQ                          zmq.REP
 #         -------                          ------
-#         '{"jsonrpc"...}'            -
-#                                      `-> '{"jsonrpc"...}'
-#                                       -  '{"result"...}'
-#         '{"result"...}'            <-'
+#         '{"jsonrpc":...}'           -
+#                                      `-> '{"jsonrpc":...}'
+#                                       -  '{"result":...}'
+#         '{"result":...}'           <-'
 # 
 # This simple 0MQ REQ/REP socket pair can support simple, traditional 1:1 RPC.
-# As expected, it is the simplest to set up and use.
+# As expected, it is the simplest to set up and use.  It has certain limitations:
+# 
+#     o Since 0MQ doesn't report socket disconnections, it is not possible for
+#       the client to detect that a server has died after sending it a request.
+#       If requests have predeterminable time limits, a timeout on the Client
+#       zmq.REQ socket may be appropriate to detect dead/hung servers.
+# 
+#     o Subsequent RPC invocations may be routed to *any* server(s) that the
+#       Client zmq.REQ socket is connected to.
 # 
 # 
-#     For other zmq socket types, 0MQ adds additional routing
-# information, which must be handled:
+#     For other zmq socket types, 0MQ adds additional routing information, which
+# must be handled:
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
-#         '{"jsonrpc"...}'            -
-#                                      `-> <cli> '' '{"jsonrpc"...}'
-#                                       -  <cli> '' '{"result"...}'
-#         '{"result"...}'            <-'
+#         '{"jsonrpc":...}'           -
+#                                      `-> <cli> '' '{"jsonrpc":...}'
+#                                       -  <cli> '' '{"result":...}'
+#         '{"result":...}'           <-'
 # 
-# This supports an M:1 RPC scenario, where multiple clients make
-# requests to a single server, and each request must supply the
-# routing information to carry the corresponding reply back to the
-# correct client.
+#     This supports an M:1 RPC scenario, where multiple clients make requests to
+# a single server, and each request must supply the routing information to carry
+# the corresponding reply back to the correct client.
 # 
 # 
-#     There may be reason to add yet further data to the messages
-# transmitted over the socket's stream; to assist in establishing
-# sessions (eg. if the destination socket is shared by multiple
-# separate sessions within the same client):
+#     There may be reason to add yet further data to the messages transmitted
+# over the socket's stream; to assist in establishing sessions (eg. if the
+# destination socket is shared by multiple separate sessions within the same
+# client):
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
@@ -68,22 +146,21 @@
 #                                       -  <cli> '' <s#1> '{"result"...}'
 #         <s#1> '{"result"...}'      <-'
 # 
-# Now, an X*M:1 scenario is supported, where X sessions (threads?), in
-# each of M clients, can send RPC requests to 1 server, and the
-# results are sent back to the correct client, and then to the correct
-# session/thread within the client.  This also supports simple X*M:N
-# RPC, if the client connects its zmq.REQ socket to multiple server
-# zmq.XREP sockets; however.  Each request would be routed to a random
-# server, which is satisfactory for many applications.
+# Now, an X*M:1 scenario is supported, where X sessions (threads?), in each of M
+# clients, can send RPC requests to 1 server, and the results are sent back to
+# the correct client, and then to the correct session/thread within the client.
+# This also supports simple X*M:N RPC, if the client connects its zmq.REQ socket
+# to multiple server zmq.XREP sockets; however.  Each request would be routed to
+# a random server, which is satisfactory for many applications.
 # 
 # 
-#     To support a more strict X*M:N scenario (multiple
-# sessions/client, multiple clients, and multiple servers) with strict
-# session/server allocation, another layer is required.  The Client
-# must request a server, using a 1:N channel (eg. REQ/REP, where the
-# client REQ binds, and all the server REPs connect, or where the
-# client REQ connects to each of the multiple server REP socket bind
-# addresses).  The client then obtains a session ID and socket address:
+#     To support a more strict X*M:N scenario (multiple sessions/client,
+# multiple clients, and multiple servers) with strict session/server-thread
+# allocation, another layer is required.  The Client must request a server,
+# using a 1:N channel (eg. REQ/REP, where the client REQ binds, and all the
+# server REPs connect, or where the client REQ connects to each of the multiple
+# server REP socket bind addresses).  The client then obtains a session ID and
+# socket address:
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
@@ -92,8 +169,10 @@
 #                                       -  <cli> '' <key> <addr>
 #         <key> <addr>               <-'
 # 
-# The client then creates a new zmq.REQ socket to the address (if not
-# already existing), and then uses it to perform X*M:1 RPC
+# The client then creates a new zmq.REQ socket connected to the provided address
+# (if one not already existing), and then uses it to perform X*M:1 RPC.  The
+# supplied session key is used to associate all client session requests with the
+# same server session/thread.
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
@@ -109,8 +188,8 @@
 #                                       -  <cli> '' <key>
 #         <key>                      <-'
 # 
-# allowing the server to return the session's resources (eg. thread)
-# to the pool.
+# allowing the server to return the session's resources (eg. thread) to the
+# pool.
 # 
 
 
@@ -118,6 +197,96 @@ import zmq
 import zhelpers
 import json
 import traceback
+
+
+class client( object ):
+    """
+    Simplest remote call; blocking, no timeouts.
+
+    EXAMPLE
+
+        # Create 0MQ transport
+        context		= zmq.Context()
+        socket		= context.socket( zmq.REQ )
+        remote		= client( socket=socket, name="boo" )
+
+        # Create callable to method "first" and invoke; then "second"
+        result1		= remote.first( "some", "args" )
+        result2		= remote.second( "yet", "others" )
+
+        # Clean up; destroy proxy, then close sockets, terminate context
+        del remote
+        socket.close()
+        context.term()
+    """
+
+    def __init__( self, socket, name ):
+        """
+        Make a proxy for the object "name" on the other end of "socket".
+        """
+        self._socket		= socket
+        self._name		= name
+        self._request		= 0
+
+    def request( self ):
+        """
+        Always return a unique request ID for anything using this instance.
+        """
+        self._request	       += 1
+        return self._request
+
+    def transport( self, request ):
+        """
+        Marshall and send JSON request, blocking for result.
+        """
+        self._socket.send_multipart( [ json.dumps( request ) ] )
+        response		= self._socket.recv_multipart()
+        assert len( response ) == 1
+        return json.loads( response[0] )
+                
+    def __getattr__( self, method ):
+        """
+        Prepare to invoke name.method.  Returns callable bound to remote method,
+        using our transport and sequence of unique request IDs.
+        """
+        return self.rpc( method=self._name + '.' + method,
+                         transport=self.transport, request=self.request )
+
+    class rpc( object ):
+        """
+        Capture an RPC request as a callable, encoded using JSON-RPC
+        conventions; transport and collect result, raises generic Exception on
+        any remote error.  
+
+        Generally meant to be invoked once, but could be bound to a local and
+        invoked repeatedly; generates appropriate sequence of unique request ids
+        for each subsequent invocation.
+        """
+        def __init__( self, method, transport, request ):
+            self._method	= method
+            self._transport	= transport
+            self._request	= request
+
+        def __call__( self, *args ):
+            """
+            Enc_arodes the call into a JSON-RPC style request, transports it,
+            ensuring result has matching request id.
+            """
+            request		= {
+                'jsonrpc':	"2.0",
+                'id':		self._request(),
+                'method': 	self._method,
+                'params':	args,
+                } 
+            result		= self._transport( request )
+            if result['error']:
+                exception( result )
+                raise Exception( "Unhandled remote exception" )
+            assert result['id'] == request['id']
+            return result['result']
+
+        def exception( self, result ):
+            raise Exception( result['error'] )
 
 
 VERSION                         = "2.0"
