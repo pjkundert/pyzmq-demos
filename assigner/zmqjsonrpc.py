@@ -1,7 +1,9 @@
 # 
 # zmqjsonrpc.py
 # 
-#     An RPC framework using some JSON-RPC standards, using 0MQ for transport
+#     An RPC framework using 0MQ for transport, following the JSON-RPC standards:
+# 
+#          http://jsonrpc.org/spec.html,
 # 
 #     Originally intended to be based on the reference Python JSON-PRC
 # implementation from http://json-rpc.org, but instead provides some basic
@@ -198,6 +200,52 @@ import zhelpers
 import json
 import traceback
 
+JSONRPC_VERSION                 = "2.0"
+
+JSON_OPTIONS                    = {
+    "indent":           None,           # Not pretty-printed
+    "separators":       (',', ':'),     # Most compact representation
+    "allow_nan":        True,           # Allow nan/inf to be encoded
+    }
+
+PARSE_ERROR			= -32700
+INVALID_REQUEST			= -32600
+METHOD_NOT_FOUND		= -32601
+INVALID_PARAMS			= -32602
+INTERNAL_ERROR			= -32603
+
+MESSAGES 			= {	
+    PARSE_ERROR:	"Parse error",
+    INVALID_REQUEST:	"Invalid Request",
+    METHOD_NOT_FOUND:	"Method not found",
+    INVALID_PARAMS:	"Invalid params",
+    INTERNAL_ERROR:	"Internal error",
+}
+
+class Error( Exception ):
+    """
+    Errors transported from the remote side include an error code.  The __dict__
+    is appropriate for directly encoding as the error: value in a JSON-RPC
+    response:
+    
+        >>> zmqjsonrpc.Error(-32700).__dict__
+        {'code': -32700, 'message': 'Parse error'}
+
+    If desired, an additional optional property 'data' may be defined,
+    containing additional details of the error.
+    """
+    def __init__( self, code, message=None, data=None ):
+        self.code		= code
+        if message is None:
+            message		= MESSAGES.get( code, "Unknown error code" )
+        self.message		= message
+        if data:
+            self.data		= data
+
+    def __str__( self ):
+        if hasattr( self, 'data' ) and self.data:
+            return "%d: %s; %s" % ( self.code, self.message, self.data )
+        return "%d: %s" % ( self.code, self.message )
 
 class client( object ):
     """
@@ -224,8 +272,8 @@ class client( object ):
         """
         Make a proxy for the object "name" on the other end of "socket".
         """
-        self._socket		= socket
-        self._name		= name
+        self.socket		= socket
+        self.name		= name
         self._request		= 0
 
     def request( self ):
@@ -239,8 +287,8 @@ class client( object ):
         """
         Marshall and send JSON request, blocking for result.
         """
-        self._socket.send_multipart( [ json.dumps( request ) ] )
-        response		= self._socket.recv_multipart()
+        self.socket.send_multipart( [ json.dumps( request ) ] )
+        response		= self.socket.recv_multipart()
         assert len( response ) == 1
         return json.loads( response[0] )
                 
@@ -249,23 +297,23 @@ class client( object ):
         Prepare to invoke name.method.  Returns callable bound to remote method,
         using our transport and sequence of unique request IDs.
         """
-        return self.rpc( method=self._name + '.' + method,
+        return self.remote( method=self.name + '.' + method,
                          transport=self.transport, request=self.request )
 
-    class rpc( object ):
+    class remote( object ):
         """
         Capture an RPC request as a callable, encoded using JSON-RPC
         conventions; transport and collect result, raises generic Exception on
-        any remote error.  
+        any remote error.
 
         Generally meant to be invoked once, but could be bound to a local and
         invoked repeatedly; generates appropriate sequence of unique request ids
         for each subsequent invocation.
         """
         def __init__( self, method, transport, request ):
-            self._method	= method
-            self._transport	= transport
-            self._request	= request
+            self.method		= method
+            self.transport	= transport
+            self.request	= request
 
         def __call__( self, *args ):
             """
@@ -274,28 +322,27 @@ class client( object ):
             """
             request		= {
                 'jsonrpc':	"2.0",
-                'id':		self._request(),
-                'method': 	self._method,
+                'id':		self.request(),
+                'method': 	self.method,
                 'params':	args,
                 } 
-            result		= self._transport( request )
-            if result['error']:
-                exception( result )
-                raise Exception( "Unhandled remote exception" )
-            assert result['id'] == request['id']
-            return result['result']
+            reply		= self.transport( request )
+            if reply['error']:
+                raise self.exception( reply )
+            assert reply['id'] == request['id']
+            return reply['result']
 
-        def exception( self, result ):
-            raise Exception( result['error'] )
+        def exception( self, reply ):
+            """
+            Handles a reply error, and returns the appropriate local Exception.
+            """
+            error		= reply['error']
+            return Error( error['code'], error.get('message'), error.get('data'))
 
 
-VERSION                         = "2.0"
+# Obsolete
+
 CONTENT_TYPE                    = "content-type: application/json"
-JSON_OPTIONS                    = {
-    "indent":           None,           # Not pretty-printed
-    "separators":       (',', ':'),     # Most compact representation
-    "allow_nan":        True,           # Allow nan/inf to be encoded
-    }
 IS_SERVICE_METHOD		= "_is_service_method"
 
 def request_id( initial=1 ):
@@ -444,7 +491,7 @@ class ServiceProxy( object ):
         method                  = unicode( self.__name )
         reqid                   = unicode( self.__reqid.next() )
         data                    = json.dumps( {
-                                      "jsonrpc":        VERSION,
+                                      "jsonrpc":        JSONRPC_VERSION,
                                       "method":         method,
                                       "params":         args,
                                       "id":             reqid,

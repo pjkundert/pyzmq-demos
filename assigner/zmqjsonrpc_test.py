@@ -1,9 +1,10 @@
 import zmq
-import zmqjsonrpc
+import zmqjsonrpc as zjr
 import zhelpers
 import json
 import threading
 import time
+import traceback
 
 port				= 11223
 
@@ -13,8 +14,8 @@ class stoppable( threading.Thread ):
     Supports external thread-safe Thread stop signalling.
     """
     def __init__( self, *args, **kwargs ):
-        super( stoppable, self ).__init__( *args, **kwargs )
         self.__stop	 	= threading.Event()
+        super( stoppable, self ).__init__( *args, **kwargs )
 
     def stop( self ):
         self.__stop.set()
@@ -28,45 +29,58 @@ class stoppable( threading.Thread ):
 
 
 class server_thread( stoppable ):
-    def __init__( self, socket ):
+    """
+    Simulate a simple JSON-RPC style server on the given socket.  The optional
+    latency is the frequency at which the thread checks to see if it's been
+    stopped.  The JSON-RPC spec allows a list of 1 or more requests to be
+    transported, which maps nicely onto the 0MQ multipart messages.
+    """
+    def __init__( self, socket, latency=None, **kwargs ):
         self._socket		= socket
-        super( server_thread, self ).__init__()
+        self._latency		= float( latency or 0.25 )
+        super( server_thread, self ).__init__( **kwargs )
 
     def run( self ):
+        poller			= zmq.core.poll.Poller()
+        poller.register( self._socket, flags=zmq.POLLIN )
         while not self.stopped():
-            request         	= self._socket.recv_multipart()
-            if not request:
-                continue
-            print "Server rx. [%s]" % (
-                ", ".join( [ zhelpers.format_part( m )
-                         for m in request ] ))
-            assert len( request ) == 3
-            assert request[1] == ""	   	     # Route prefix separator
-            prefix		= request[:2]
-            requestdict         = json.loads( request[2] )
-            assert requestdict['method'].startswith( "boo." )
-            
-            result              = ", ".join( [ str( p )
-                                               for p in requestdict['params']] )
-            
-            replydict           = {
-                "jsonrpc":          requestdict['jsonrpc'],
-                "id":               requestdict['id'],
-                "result":           result,
-                "error":            None,
-                }
-            reply	       	= [json.dumps( replydict,
-                                               **zmqjsonrpc.JSON_OPTIONS)]
-            
-            print "Server tx. [%s]" % (
-                ", ".join( [ zhelpers.format_part( m )
-                             for m in prefix + reply ] ))
-            
-            self._socket.send_multipart( reply, prefix=prefix )
+            for socket, _ in poller.poll( timeout=self._latency ):
+                replies		= []
+                received	= socket.recv_multipart()
+                separator	= received.index('')
+                prefix		= received[:separator+1]
+                print "Server rx. [%s]" % (
+                    ", ".join( [ zhelpers.format_part( m )
+                                 for m in received ] ))
+                for request in received[separator+1:]:
+                    try:
+                        req 	= json.loads( request )
+                        assert req['jsonrpc'] == "2.0"
+                    except Exception, e:
+                        rpy 	= {
+                            "jsonrpc":	zjr.JSONRPC_VERSION,
+                            "id":	None,
+                            "error":    zjr.Error(zjr.INVALID_REQUEST,
+                                                  data="Bad JSON-RPC").__dict__,
+                        }
+                    else:
+                        result 	= ", ".join( [ str( p )
+                                               for p in req['params']] )
+                        rpy     = {
+                            "jsonrpc":  req['jsonrpc'],
+                            "id":       req['id'],
+                            "result":   result,
+                            "error":    None,
+                        }
+                    replies.append( json.dumps( rpy, **zjr.JSON_OPTIONS ))
+
+                print "Server tx. [%s]" % (
+                    ", ".join( [ zhelpers.format_part( m )
+                                 for m in prefix + replies ] ))
+                socket.send_multipart( replies, prefix=prefix )
 
 
 def test_base_client():
-
     global port
     port		       += 1
     
@@ -74,7 +88,7 @@ def test_base_client():
     # Create 0MQ transport
     context			= zmq.Context()
     socket			= context.socket( zmq.REQ )
-    remote			= zmqjsonrpc.client( socket=socket, name="boo" )
+    remote			= zjr.client( socket=socket, name="boo" )
 
     # Create the test server and connect client to it
     svr				= context.socket( zmq.XREP )
@@ -90,7 +104,6 @@ def test_base_client():
     assert result1 == "some, args"
     result2			= remote.second( "yet", "others" )
     assert result2 == "yet, others"
-    done			= True
 
     svrthr.join()
     svr.close()
@@ -100,67 +113,6 @@ def test_base_client():
     socket.close()
     context.term()
 
-def test_simulate_server():
-    global port
-    port 		       += 1
-    clictx                      = zmq.Context()
-    cli                         = clictx.socket( zmq.REQ )
-    cli.connect( "tcp://localhost:%d" % ( port ))
-
-    svrctx                      = zmq.Context()
-    svr                         = svrctx.socket( zmq.XREP )
-    svr.bind( "tcp://*:%d" % ( port ))
-
-    # Simulate the Server side of the 0MQ JSON-RPC request, receiving
-    # and processing the raw 0MQ request.
-    def svrfun():
-        request         	= svr.recv_multipart()
-        print "Server rx. [%s]" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in request ] ))
-        assert len( request ) == 5
-        assert request[1] == ""	   	     # Route prefix separator
-        assert request[2].lower() == "1"     # Session ID
-        assert request[3].lower() == zmqjsonrpc.CONTENT_TYPE
-        prefix			= request[:2]
-        sessid                  = request[2:3]
-
-        requestdict             = json.loads( request[4] )
-        assert requestdict['method'] == "boo.foo"
-        assert len( requestdict['params'] ) == 3
-
-        result                  = ", ".join( [ str( p )
-                                               for p in requestdict['params']] )
-        replydict               = {
-            "jsonrpc":          requestdict['jsonrpc'],
-            "id":               requestdict['id'],
-            "result":           result,
-            "error":            None,
-            }
-        reply		       	= [json.dumps( replydict,
-                                               **zmqjsonrpc.JSON_OPTIONS)]
-        print "Server tx. [%s]" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in prefix + sessid + reply ] ))
-            
-        svr.send_multipart( sessid + reply, prefix=prefix )
-
-    svrthr                      = threading.Thread( target=svrfun )
-    svrthr.start()
-
-    pxy                         = zmqjsonrpc.ServiceProxy(
-                                      socket=zmqjsonrpc.session_socket(
-                                          cli, sessid=["1"] ),
-                                      serviceName="boo" )
-    result                      = pxy.foo( 1, 2, 3 )
-    assert result == "1, 2, 3"
-    del pxy
-
-    svrthr.join()
-    svr.close()
-    svrctx.term()
-    cli.close()
-    clictx.term()
 
 class zmqwrapper( stoppable ):
     """
@@ -183,40 +135,3 @@ class zmqwrapper( stoppable ):
                 self.__handler.handleRequest( request )
 
 
-class boo( object ):
-    def foo( *args ):
-        return ", ".join( str( a ) for a in args )
-
-def test_simplest():
-    global port
-    handler			= zmqjsonrpc.ServiceHandler( service=boo() )
-    result			= handler.handleRequest(
-        '{"params":[1,2,3],"jsonrpc":"2.0","method":"boo.foo","id":"1"}' )
-    assert result == "1, 2, 3"
-
-    port 		       += 1
-    clictx                      = zmq.Context()
-    cli                         = clictx.socket( zmq.REQ )
-    cli.connect( "tcp://localhost:%d" % ( port ))
-    svrctx                      = zmq.Context()
-    svr                         = svrctx.socket( zmq.REP )
-    svr.setsockopt( zmq.RCVTIMEO, 250 )
-    svr.bind( "tcp://*:%d" % ( port ))
-
-    cli.send_multipart( [ "hi" ] )
-    assert svr.recv_multipart()  == [ "hi" ]
-    svr.send_multipart( [ "lo" ] )
-    assert cli.recv_multipart() == [ "lo" ]
-
-    svrthr                      = zmqwrapper( socket=svr, handler=handler )
-    svrthr.daemon		= True
-    svrthr.start()
-
-    pxy                         = zmqjsonrpc.ServiceProxy(
-                                      socket=cli,
-                                      serviceName="boo" )
-    result                      = pxy.foo( 1, 2, 3 )
-    assert result == "1, 2, 3"
-    del pxy
-
-    svrthr.join()
