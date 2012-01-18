@@ -195,10 +195,11 @@
 # 
 
 
-import zmq
-import zhelpers
 import json
+import threading
 import traceback
+import zhelpers
+import zmq
 
 JSONRPC_VERSION                 = "2.0"
 
@@ -213,6 +214,7 @@ INVALID_REQUEST			= -32600
 METHOD_NOT_FOUND		= -32601
 INVALID_PARAMS			= -32602
 INTERNAL_ERROR			= -32603
+SERVER_ERROR			= -32000
 
 MESSAGES 			= {	
     PARSE_ERROR:	"Parse error",
@@ -220,6 +222,7 @@ MESSAGES 			= {
     METHOD_NOT_FOUND:	"Method not found",
     INVALID_PARAMS:	"Invalid params",
     INTERNAL_ERROR:	"Internal error",
+    SERVER_ERROR:	"Server error",
 }
 
 class Error( Exception ):
@@ -249,7 +252,11 @@ class Error( Exception ):
 
 class client( object ):
     """
-    Simplest remote call; blocking, no timeouts.
+    Proxy object to initiate RPC invocations to any non-'_...' method; blocking,
+    no timeouts.  Default _transport assumes that the provided 0MQ socket strips
+    off any routing prefix before delivering payload.
+
+    Not threadsafe; all invocations are assumed to be serialized.
 
     EXAMPLE
 
@@ -266,6 +273,13 @@ class client( object ):
         del remote
         socket.close()
         context.term()
+
+    Any instance attribute not found is assumed to be a remote method, and
+    returns a callable which may be used (repeatedly, if desired) to invoke the
+    remote method.
+
+    No public methods (all methods invoked are assumed to be remote) Override
+    non-public '_...' methods to alter basic default behaviour.
     """
 
     def __init__( self, socket, name ):
@@ -274,18 +288,20 @@ class client( object ):
         """
         self.socket		= socket
         self.name		= name
-        self._request		= 0
+        self._request_id	= 0
 
-    def request( self ):
+    def _request( self ):
         """
         Always return a unique request ID for anything using this instance.
         """
-        self._request	       += 1
-        return self._request
+        self._request_id        += 1
+        return self._request_id
 
-    def transport( self, request ):
+    def _transport( self, request ):
         """
-        Marshall and send JSON request, blocking for result.
+        Marshall and send JSON request, blocking for result.  This is the
+        transport underlying the callables produced.  Override this to implement
+        different RPC transports or encodings.
         """
         self.socket.send_multipart( [ json.dumps( request ) ] )
         response		= self.socket.recv_multipart()
@@ -295,12 +311,12 @@ class client( object ):
     def __getattr__( self, method ):
         """
         Prepare to invoke name.method.  Returns callable bound to remote method,
-        using our transport and sequence of unique request IDs.
+        using our transport and sequence of unique request IDs. 
         """
-        return self.remote( method=self.name + '.' + method,
-                         transport=self.transport, request=self.request )
+        return self._remote( method=self.name + '.' + method,
+                             transport=self._transport, request=self._request )
 
-    class remote( object ):
+    class _remote( object ):
         """
         Capture an RPC request as a callable, encoded using JSON-RPC
         conventions; transport and collect result, raises generic Exception on
@@ -317,7 +333,7 @@ class client( object ):
 
         def __call__( self, *args ):
             """
-            Enc_arodes the call into a JSON-RPC style request, transports it,
+            Encodes the call into a JSON-RPC style request, transports it,
             ensuring result has matching request id.
             """
             request		= {
@@ -339,6 +355,217 @@ class client( object ):
             error		= reply['error']
             return Error( error['code'], error.get('message'), error.get('data'))
 
+
+def find_object( names, root ):
+    """
+    Find the object identified by the list 'names', starting with the given root
+    {'name': object} dict, and searching down through the dir() of each named
+    sub-object.  Returns the final target object.
+    """
+    assert type( root ) is dict
+    attrs			= root.keys()
+    obj				= None
+    # print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
+    for name in names:
+        if not obj:
+            # No object yet; use root dictionary provided
+            obj			= root.get( name )
+        else:
+            if name in dir( obj ):
+                obj		= getattr( obj, name )
+        if not obj:
+            break
+    return obj
+
+def all_methods(obj):
+    """
+    Return a list of names of methods of `obj` (from
+    multiprocessing/managers.py)
+    """
+    temp = []
+    for name in dir(obj):
+        func = getattr(obj, name)
+        if hasattr(func, '__call__'):
+            temp.append(name)
+    return temp
+
+class server( object ):
+    """
+    Terminates RPC invocations to the subset of methods on the 'root' dictionary
+    of objects (eg. pass globals(), if you wish, and caller is guaranteed to be
+    secure!); the target object and methods are simply found by name.
+
+    In the default implementation, all methods in a target object not beginning
+    with '_' are considered public (see multiprocessing/managers.py's
+    public_methods).  
+
+    An object may customize __dir__ to limit method access, or you may override
+    and customize 'validate' to enforce some other access methodology.
+    """
+    def __init__( self, root=None, socket=None, latency=None ):
+        self.root		= root
+        self.poller		= zmq.core.poll.Poller()
+        if socket:
+            self.register( socket )
+        self.latency		= float( latency or 0.25 )
+
+        self.cache		= {}
+
+    def register( self, socket ):
+        """
+        Add another socket that we can receive incoming RPC requests on.
+        """
+        self.poller.register( socket, zmq.POLLIN )
+
+
+    def public_methods( self, obj ):
+        '''
+        Return a list of names of methods of `obj` which do not start with '_'
+        (from multiprocessing/managers.py)
+        '''
+        return [name for name in all_methods(obj) if name[0] != '_']
+
+    def resolve( self, target, root ):
+        """
+        Validate and locate method targets in the form (name.)*method, returning
+        the named bound method.
+
+        The first time a "name.method" is encountered, and all available methods
+        are found and cached.  This also results in reference(s) to the object
+        being created, incrementing its refcount and preventing it from
+        disappearing.
+        """
+        method			= self.cache.get( target )
+        if not method:
+            terms		= target.split('.')
+            # Assume all names before the last identify a chain of objects
+            path		= terms[:-1]
+            name		= terms[-1]
+            obj			= find_object( path, root )
+            if obj:
+                methods		= self.public_methods( obj )
+                for m in methods:
+                    self.cache['.'.join( path + [ m ])] = getattr( obj, m )
+                method		= self.cache.get( target )
+
+        return method
+
+    def stopped( self ):
+        """
+        Use a superclass 'stopped' method if available, otherwise never stop.
+        """
+        try:
+            super( server, self ).stopped()
+        except:
+            pass
+        return False
+
+    def run( self ):
+        """
+        If combined with a threading.Thread (eg. stoppable) in a derived class,
+        this method will process incoming RPC requests 'til stopped.
+        """
+        while not self.stopped():
+            for socket, _ in self.poller.poll( timeout=self.latency ):
+                self.process( socket )
+
+    def error( self, exception, request ):
+        """
+        Handle arbitrary server-side method exception 'exc', produced by the
+        encoded request 'req', returning an appropriate Error exception.
+
+        Override if further exception information must be retained and/or logged
+        (eg. for subsequent calls to interrogate the exception details)
+        """
+        if isinstance( exception, Error ):
+            return exception
+        return Error( SERVER_ERROR, data="%s ==> %s" % (
+                request['method'], str( exception )))
+
+    def process( self, socket ):
+        """
+        Simulate a simple JSON-RPC style server on the given socket.  The
+        JSON-RPC spec allows a list of 1 or more requests to be transported,
+        which maps nicely onto the 0MQ multipart messages.  Assumes that 0MQ
+        routing prefix (eg. from zmq.XREP) will be prepended to a list of
+        JSON-RPC requests.
+
+        Must trap all Exceptions, and return an appropriate reply message.
+        """
+        replies			= []
+        received		= socket.recv_multipart()
+        separator		= received.index('')
+        prefix			= received[:separator+1]
+        print "Server rx. [%s]" % (
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in received ] ))
+        for request in received[separator+1:]:
+            rpy			= {
+                'id':		None,
+                'jsonrpc':	JSONRPC_VERSION,
+                'result':	None,
+                'error':	None,
+                }
+            try:
+                # Attempt to un-marshall the JSON-RPC
+                try:
+                    req 		= json.loads( request )
+                    assert req['jsonrpc'] == JSONRPC_VERSION
+                    rpy['id']		= req['id']
+                except Exception, e:
+                    raise Error( INVALID_REQUEST,
+                                 data="Bad JSON-RPC: " + str(e))
+
+                if type(req['params']) is not list:
+                    raise Error( INVALID_PARAMS, data="Must be a list" )
+                
+                # Valid JSON-RPC data.  Attempt to resolve method
+                method		= self.resolve( req['method'], self.root )
+                if not method:
+                    raise Error( METHOD_NOT_FOUND,
+                                 data="No method named '%s'" % ( req['method'] ))
+                
+                # Attempt to dispatch method; *arbitrary* exceptions!
+                rpy['result']		= method( *req['params'] )
+            except Exception, e:
+                # The Error Exception is designed so it's dict contains JSON-RPC
+                # appropriate attributes!  All other rpy items are correct (eg.
+                # 'result' will retail None, 'til method is dispatched without
+                # exception!
+                rpy['error']		= self.error( e, req ).__dict__
+
+            if rpy['id']:
+                # Not a JSON-RPC Notification; append response for this request
+                replies.append( json.dumps( rpy, **JSON_OPTIONS ))
+
+        print "Server tx. [%s]" % (
+            ", ".join( [ zhelpers.format_part( m )
+                         for m in prefix + replies ] ))
+        socket.send_multipart( replies, prefix=prefix )
+                
+
+class stoppable( threading.Thread ):
+    """
+    Supports external thread-safe Thread stop signalling.
+    """
+    def __init__( self, *args, **kwargs ):
+        self.__stop	 	= threading.Event()
+        super( stoppable, self ).__init__( *args, **kwargs )
+
+    def stop( self ):
+        self.__stop.set()
+
+    def stopped( self ):
+        return self.__stop.is_set()
+
+    def join( self, *args, **kwargs ):
+        self.stop()
+        super( stoppable, self ).join( *args, **kwargs )
+
+class server_thread( server, stoppable ):
+    def __init__( self, root=None, socket=None, latency=None, **kwargs ):
+        server.__init__( self, root=root, socket=socket, latency=latency )
+        stoppable.__init__( self, **kwargs )
 
 # Obsolete
 
