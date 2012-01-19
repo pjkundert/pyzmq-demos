@@ -282,7 +282,7 @@ class client( object ):
     non-public '_...' methods to alter basic default behaviour.
     """
 
-    def __init__( self, socket, name ):
+    def __init__( self, socket, name="" ):
         """
         Make a proxy for the object "name" on the other end of "socket".
         """
@@ -311,9 +311,9 @@ class client( object ):
     def __getattr__( self, method ):
         """
         Prepare to invoke name.method.  Returns callable bound to remote method,
-        using our transport and sequence of unique request IDs. 
+        using our transport and sequence of unique request IDs.   
         """
-        return self._remote( method=self.name + '.' + method,
+        return self._remote( method='.'.join([n for n in [self.name, method] if n]),
                              transport=self._transport, request=self._request )
 
     class _remote( object ):
@@ -365,7 +365,7 @@ def find_object( names, root ):
     assert type( root ) is dict
     attrs			= root.keys()
     obj				= None
-    # print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
+    print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
     for name in names:
         if not obj:
             # No object yet; use root dictionary provided
@@ -392,8 +392,8 @@ def all_methods(obj):
 class server( object ):
     """
     Terminates RPC invocations to the subset of methods on the 'root' dictionary
-    of objects (eg. pass globals(), if you wish, and caller is guaranteed to be
-    secure!); the target object and methods are simply found by name.
+    of objects (eg. pass globals(), if the caller is guaranteed to be secure!);
+    the target object and methods are simply found by name.
 
     In the default implementation, all methods in a target object not beginning
     with '_' are considered public (see multiprocessing/managers.py's
@@ -402,7 +402,7 @@ class server( object ):
     An object may customize __dir__ to limit method access, or you may override
     and customize 'validate' to enforce some other access methodology.
     """
-    def __init__( self, root=None, socket=None, latency=None ):
+    def __init__( self, root, socket=None, latency=None ):
         self.root		= root
         self.poller		= zmq.core.poll.Poller()
         if socket:
@@ -417,13 +417,18 @@ class server( object ):
         """
         self.poller.register( socket, zmq.POLLIN )
 
+    def filter_method( self, name ):
+        """
+        Detect unacceptable (non-public) methods; start with '_'
+        """
+        return name[0] == '_'
 
     def public_methods( self, obj ):
-        '''
-        Return a list of names of methods of `obj` which do not start with '_'
+        """
+        Return a list of names of public methods of `obj`.
         (from multiprocessing/managers.py)
-        '''
-        return [name for name in all_methods(obj) if name[0] != '_']
+        """
+        return [name for name in all_methods(obj) if not self.filter_method( name )]
 
     def resolve( self, target, root ):
         """
@@ -434,20 +439,29 @@ class server( object ):
         are found and cached.  This also results in reference(s) to the object
         being created, incrementing its refcount and preventing it from
         disappearing.
+
+        We have to handle finding bound methods on objects, or simple functions
+        defined in the supplied root namespace.
         """
         method			= self.cache.get( target )
         if not method:
+            # All names before the last one identify a chain of objects
             terms		= target.split('.')
-            # Assume all names before the last identify a chain of objects
             path		= terms[:-1]
             name		= terms[-1]
-            obj			= find_object( path, root )
-            if obj:
-                methods		= self.public_methods( obj )
-                for m in methods:
-                    self.cache['.'.join( path + [ m ])] = getattr( obj, m )
-                method		= self.cache.get( target )
-
+            if path:
+                # A path; A bound method of an object
+                obj		= find_object( path, root )
+                if obj:
+                    methods	= self.public_methods( obj )
+                    for m in methods:
+                        self.cache['.'.join( path + [ m ])] = getattr( obj, m )
+                    method	= self.cache.get( target )
+            else:
+                # No path; A simple function in the root scope
+                if not self.filter_method( name ):
+                    method	= root.get( name )
+                
         return method
 
     def stopped( self ):
@@ -455,7 +469,7 @@ class server( object ):
         Use a superclass 'stopped' method if available, otherwise never stop.
         """
         try:
-            super( server, self ).stopped()
+            return super( server, self ).stopped()
         except:
             pass
         return False
@@ -563,297 +577,10 @@ class stoppable( threading.Thread ):
         super( stoppable, self ).join( *args, **kwargs )
 
 class server_thread( server, stoppable ):
-    def __init__( self, root=None, socket=None, latency=None, **kwargs ):
+    """
+    A JSON-RPC server Thread class that stops when joined.
+    """
+    def __init__( self, root, socket=None, latency=None, **kwargs ):
         server.__init__( self, root=root, socket=socket, latency=latency )
         stoppable.__init__( self, **kwargs )
 
-# Obsolete
-
-CONTENT_TYPE                    = "content-type: application/json"
-IS_SERVICE_METHOD		= "_is_service_method"
-
-def request_id( initial=1 ):
-    """
-    JSON-RPC request 'id' enumerator generator.  By default, returns a
-    monotonically increasing integer value.  May be safely shared by
-    the many ServiceProxy objects representing the methods being, but
-    is not thread-safe.
-    """
-    while True:
-        yield initial
-        initial                += 1
-
-
-class session_socket( object ):
-    """
-    Transparently supports session ID lists and/or 0MQ routing
-    prefixes on transported 0MQ message lists, while presenting the
-    basic 0MQ send_/recv_multipart interface.
-
-    Encapsulates a zmq.XREQ or zmq.XREP socket endpoint,
-    adding/stripping optional session ID and/or routing label prefix
-    lists on each send_/recv_multipart invocation.
-    """
-    def __init__( self, socket, sessid, prefix=None ):
-        self.__socket           = socket
-        assert sessid is None or type( sessid ) is list
-        self.__sessid           = sessid or []
-        assert prefix is None or type( prefix ) is list
-        self.__prefix           = prefix or []
-
-    def send_multipart( self, data ):
-        """
-        Sends data list with the supplied routing prefix (if any), and
-        prepends any session id before the supplied data.
-        """
-        prefix                  = self.__prefix
-        assert type( data ) is list
-        payload                 = self.__sessid + data
-        print "Sending (to %s): %s" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in prefix ] ),
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in payload ] ))
-        self.__socket.send_multipart( payload, prefix=prefix )
-
-    def recv_multipart( self ):
-        """
-        Removes any leading prefix or session id from the result; fails if no
-        session id is present.  If a __prefix is specified, then we expect that
-        prefix on messages received; the message must contain a '' separator.
-        """
-        receive                 = self.__socket.recv_multipart()
-        if self.__prefix:
-            sep			= receive.index( '' )
-            prefix              = receive[:sep]
-            payload             = receive[sep+1:]
-        else:
-            prefix		= []
-            payload		= receive
-        if prefix and prefix != self.__prefix:
-            raise Exception( "Expected routing prefix: [%s], received [%s]" % (
-                    ", ".join(  [ zhelpers.format_part( m )
-                                  for m in self.__prefix ] ),
-                    ", ".join(  [ zhelpers.format_part( m )
-                                  for m in prefix ] )))
-            
-        print "Receive (fr %s): %s" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in prefix ] ),
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in payload ] ))
-        if self.__sessid:
-            if payload[:len(self.__sessid)] == self.__sessid:
-                payload          = payload[len(self.__sessid):]
-            else:
-                raise Exception( "Expected session ID: [%s], received [%s]" % (
-                    ", ".join(  [ zhelpers.format_part( m )
-                                  for m in self.__sessid ] ),
-                    ", ".join(  [ zhelpers.format_part( m )
-                                  for m in payload[:len(self.__sessid)]] )))
-        return payload
-
-# 
-# The ServiceProxy (RPC Client), and ServiceHandler (RPC
-# Server) interfaces, minimally modified to accept a 0MQ socket,
-# instead of a (HTTP) URL to access the service endpoint.
-# 
-
-# 
-# The 0MQ JSON-RPC Client interface:  
-# 
-class JSONRPCException( Exception ):
-    """
-    The Exception raised if an non-None 'error' is returned via the
-    JSON-RPC response.
-    """
-    def __init__(self, rpcError):
-        Exception.__init__(self)
-        self.error = rpcError
-
-class ServiceProxy( object ):
-    """
-    Implements remote invocation of methods via JSON-RPC conventions.
-    The 0MQ socket provided is returned in many ServiceProxy objects,
-    so ensure that they are not shared between threads, as 0MQ socket
-    objects are not thread-safe.
-
-    Expects the 0MQ socket to return only the response data (not any
-    routing prefix information); encapsulate other 0MQ socket types
-    (eg. zmq.XREP, which return (labels, messages) tuples from
-    recv_multipart()), so they handle the routing prefix labels, etc.
-
-    TODO
-    
-    Support timeouts and tx/rx of keepalive heartbeats, to ensure
-    remote service remains alive on long-lived requests.  This
-    requires handling of 0MQ timeouts on recv_multipart, and
-    transmission of appropriate serialized keepalive requests,
-    reception of keepalive responses.  The detection of no response
-    within a certain period must trigger an appropriate Exception
-    indicating failure of the service.
-
-    No multithreading is required on this side, as the keepalive
-    heartbeat may be transmitted (and detection of lack of response
-    computed) on timeout of recv_multipart.  On the remote
-    (ServiceHandler) end, however, an asynchronous thread may be
-    required to service the keepalive heartbeat responses in a timely
-    manner.
-    """
-    def __init__(self, socket, serviceName=None, reqId=None):
-        self.__socket           = socket
-        self.__name             = serviceName
-        self.__reqid            = reqId if reqId is not None else request_id()
-
-    def __getattr__( self, name ):
-        if self.__name != None:
-            name = "%s.%s" % (self.__name, name)
-        return ServiceProxy( self.__socket, serviceName=name, reqId=self.__reqid )
-
-    def __call__( self, *args ):
-        """
-        Invoke the method via JSON-RPC, via the 0MQ socket, and return
-        the result if successful.
-        """
-        method                  = unicode( self.__name )
-        reqid                   = unicode( self.__reqid.next() )
-        data                    = json.dumps( {
-                                      "jsonrpc":        JSONRPC_VERSION,
-                                      "method":         method,
-                                      "params":         args,
-                                      "id":             reqid,
-                                      }, **JSON_OPTIONS )
-        self.__socket.send_multipart( [CONTENT_TYPE, data] )
-
-        # Receive and decode JSON response data.  May raise ValueError,
-        # etc. exception, if not valid JSON.  Will raise AttributeError
-        # exceptions if response dict doesn't contain required 'error',
-        # 'result', 'id' fields, and AssertionError if values are not as
-        # expected.  See jsonrpc/proxy.py for reference implementation.
-        # Handle restarts
-        respdata                = self.__socket.recv_multipart()
-        resp                    = json.loads( respdata[0] )
-        assert resp['id'] == reqid, \
-            "Invalid JSON-RPC id '%s'; expected '%s'"  % ( resp['id'], reqid )
-        if resp['error'] != None:
-            raise jsonrpc.JSONRPCException(resp['error'])
-        return resp['result']
-         
-
-
-# 
-# The 0MQ JSON-RPC Server interface
-# 
-def ServiceMethod( function ):
-    """
-    Decorator for functions/methods intended to be remotely accessible.
-    """
-    setattr( function, IS_SERVICE_METHOD, True )
-    return function
-
-
-def ServiceException( Exception ):
-    pass
-
-def ServiceRequestNotTranslatable( ServiceException ):
-    pass
-
-def BadServiceRequest( ServiceException ):
-    pass
-
-def ServiceMethodNotFound( ServiceException ):
-    pass
-
-
-class ServiceHandler( object ):
-    def __init__( self, service ):
-        self.__service		= service
-
-    def trap_exception( self, exc ):
-        """
-        An exception has occured; trap, log, etc. any of the exception data here, if desired.
-        """
-        pass
-
-    def handleRequest( self, data ):
-        """
-        
-        """
-        error			= None
-        result			= None
-        reqid			= None
-
-        try:
-            # Decode request.  May result in ValueError, KeyError,
-            # AssertionError exceptions if request is invalid.
-            try:
-                request		= json.loads( data )
-            except Exception, e:
-                raise ServiceRequestNotTranslatable(
-                    str(e) + "; JSON-RPC request invalid" )
-
-            try:
-                version		= request['jsonrpc']
-                reqid		= request['id']
-                method		= request['method']
-                params		= request['params']
-                assert type( params ) is list
-            except Exception, e:
-                raise BadServiceRequest(
-                    str(e) + "; JSON-RPC request bad/missing parameter" )
-
-            # Locate method.  May result in ServiceMethodNotFound exception.
-            handle		= getattr( self.__service, method, None )
-            if not handle or not hasattr( handle, IS_SERVICE_METHOD ):
-                raise ServiceMethodNotFound(
-                    "%s; JSON-RPC method not %s" % (
-                        method, "allowed" if handle else "found" ))
-
-            # Invoke method, producing result.  May result in
-            # arbitrary exceptions.
-            result		= method( *params )
-        except Exception, e:
-            # Exception encountered while unmarshalling parameters or invoking
-            # target method.  Capture all exception detail, including the args
-            # (if they can be encoded)
-            exc_type		= "%s.%s" % ( type(e).__module, type(e).__name )
-            exc_mesg		= traceback.format_exception_only( type(e), e )[-1].strip()
-            error 		= {
-                "name": 	exc_type,
-                "message":	exc_mesg,
-                }
-            try:
-                json.encode({'args': exc.args})
-            except TypeErorr:
-                pass
-            else:
-                error["args"]	= e.args
-
-
-        # At this point, either result (and reqid) OR error is set; not both.
-        # Attempt to encode and return JSON-RPC result; on failure, fall thru
-        # and return error.
-        if not error:
-            try:
-                return json.dumps( {
-                        "id":		reqid,
-                        "result":	result,
-                        "error": 	None,
-                        } )
-            except Exception, e:
-                error		= {
-                    "name":	"JSONEncodeException",
-                    "message":	str(e) + "; JSON-RPC result not serializable"
-                    }
-
-        # No result, or attempt to encode it must have failed; encode
-        # and return JSON-RPC encoded error response.
-        return json.dumps( {
-                "id":		reqid,
-                "result":	None,
-                "error": 	error,
-                })
-            
-        
-
-            
