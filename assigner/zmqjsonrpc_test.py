@@ -56,37 +56,22 @@ def test_base_client():
     assert result == 31
 
     # Various ways of failing to invoke nonexistent methods
-    try:
-        # no such method
-        result			= remboo.nothere( "whatever" )
-        assert not "nonexistent method found: %s" % result
-    except Exception, e:
-        assert type(e) is zjr.Error
-        assert "No method" in str(e)
-        assert "-32601" in str(e)
-    # Hidden method (leading '_')
-    try:
-        result			= remboo._hidden( "whatever" )
-        assert not "nonexistent method found: %s" % result
-    except Exception, e:
-        assert type(e) is zjr.Error
-        assert "No method" in str(e)
-        assert "-32601" in str(e)
-    # No such function
-    try:
-        result			= remgbl.dir()
-        assert not "nonexistent method found: %s" % result
-    except Exception, e:
-        assert type(e) is zjr.Error
-        assert "No method" in str(e)
-        assert "-32601" in str(e)
+    for doit in [ 
+        lambda: remboo.nothere(),	# no such method
+        lambda: remboo._hidden(),	# Hidden method (leading '_')
+        lambda: remgbl.dir(),		# No such function
+        ]:
+        try:
+            result		= doit()
+            assert not "nonexistent method found: %s" % result
+        except Exception, e:
+            assert type(e) is zjr.Error
+            assert "Method not found" in str(e)
+            assert "-32601" in str(e)
+
 
     svrthr.join()
     svr.close()
-
-    # Clean up; destroy proxy, then close sockets, terminate context
-    del remboo
-    del remgbl
     socket.close()
     context.term()
 

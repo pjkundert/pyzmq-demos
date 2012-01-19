@@ -448,20 +448,26 @@ class server( object ):
             # All names before the last one identify a chain of objects
             terms		= target.split('.')
             path		= terms[:-1]
+            pathstr		= '.'.join( path )
             name		= terms[-1]
             if path:
                 # A path; A bound method of an object
-                obj		= find_object( path, root )
-                if obj:
-                    methods	= self.public_methods( obj )
-                    for m in methods:
-                        self.cache['.'.join( path + [ m ])] = getattr( obj, m )
-                    method	= self.cache.get( target )
+                if pathstr not in self.cache:
+                    # ...and we haven't previously searched for this object.
+                    self.cache[pathstr] = None
+                    obj		= find_object( path, root )
+                    if obj:
+                        methods	= self.public_methods( obj )
+                        for m in methods:
+                            self.cache[pathstr + '.' + m] = getattr( obj, m )
+                        method	= self.cache.get( target )
             else:
                 # No path; A simple function in the root scope
                 if not self.filter_method( name ):
                     method	= root.get( name )
-                
+            if not method:
+                # Still not found; memoize as invalid method
+                self.cache[target] = None
         return method
 
     def stopped( self ):
