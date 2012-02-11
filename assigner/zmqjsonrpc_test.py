@@ -75,4 +75,28 @@ def test_base_client():
     socket.close()
     context.term()
 
+def test_session():
+    global port
+    port		       += 1
+    
+    # Create 0MQ transport
+    context			= zmq.Context()
+    socket			= context.socket( zmq.REQ )
 
+    # Create the test server and connect client to it
+    svr				= context.socket( zmq.XREP )
+    svr.setsockopt( zmq.RCVTIMEO, 250 )
+    svr.bind( "tcp://*:%d" % ( port ))
+    socket.connect( "tcp://localhost:%d" % ( port ))
+
+    # Create a server_session, allowing access to globals (including 'boo')
+    svrthr                      = zjr.server_session_thread(
+        root=globals(), socket=svr, iface="127.0.0.1", port=11245 )
+    svrthr.start()
+
+    # Create a client_session, attempting to access methods of "boo"
+    remses			= zjr.client_session( socket=socket, name="boo" )
+
+    result			= remses.first( "all", "good", "boys", 
+                                                "deserve", 1, "fudge" )
+    assert result == "all, good, boys, deserve, 1, fudge"

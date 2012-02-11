@@ -200,6 +200,7 @@ import threading
 import traceback
 import zhelpers
 import zmq
+import random
 
 JSONRPC_VERSION                 = "2.0"
 
@@ -249,6 +250,17 @@ class Error( Exception ):
         if hasattr( self, 'data' ) and self.data:
             return "%d: %s; %s" % ( self.code, self.message, self.data )
         return "%d: %s" % ( self.code, self.message )
+
+# 
+# 0MQ JSON-RPC
+# 
+# client		-- zmq.REQ basic blocking client
+# server		-- zmq.XREP basic blocking server
+# server_thread		-- a stoppable Thread implementing a server
+# 
+# client_session	-- allocates a session for duration of client
+# server_session	-- provides sessions over a pool of servers
+# 
 
 class client( object ):
     """
@@ -313,18 +325,20 @@ class client( object ):
         Prepare to invoke name.method.  Returns callable bound to remote method,
         using our transport and sequence of unique request IDs.   
         """
-        return self._remote( method='.'.join([n for n in [self.name, method] if n]),
-                             transport=self._transport, request=self._request )
+        print "__getattr__: %s" % ( method )
+        return self._remote(
+            method='.'.join( [ n for n in [ self.name, method ] if n ] ),
+            transport=self._transport, request=self._request )
 
     class _remote( object ):
         """
-        Capture an RPC request as a callable, encoded using JSON-RPC
-        conventions; transport and collect result, raises generic Exception on
-        any remote error.
+        Capture an RPC API method as a callable.  When invoked, arguments are
+        encoded using JSON-RPC conventions; transport and collect result, raises
+        Error exception on any remote error.
 
         Generally meant to be invoked once, but could be bound to a local and
         invoked repeatedly; generates appropriate sequence of unique request ids
-        for each subsequent invocation.
+        for each invocation.
         """
         def __init__( self, method, transport, request ):
             self.method		= method
@@ -379,8 +393,8 @@ def find_object( names, root ):
 
 def all_methods(obj):
     """
-    Return a list of names of methods of `obj` (from
-    multiprocessing/managers.py)
+    Return a list of names of methods of `obj` (from multiprocessing,
+    managers.py)
     """
     temp = []
     for name in dir(obj):
@@ -402,7 +416,9 @@ class server( object ):
     An object may customize __dir__ to limit method access, or you may override
     and customize 'validate' to enforce some other access methodology.
     """
-    def __init__( self, root, socket=None, latency=None ):
+    def __init__( self, root=None, socket=None, latency=None ):
+        if root is None:
+            root		= locals
         self.root		= root
         self.poller		= zmq.core.poll.Poller()
         if socket:
@@ -419,7 +435,7 @@ class server( object ):
 
     def filter_method( self, name ):
         """
-        Detect unacceptable (non-public) methods; start with '_'
+        Detect unacceptable (non-public) methods; starting with '_'
         """
         return name[0] == '_'
 
@@ -428,20 +444,22 @@ class server( object ):
         Return a list of names of public methods of `obj`.
         (from multiprocessing/managers.py)
         """
-        return [name for name in all_methods(obj) if not self.filter_method( name )]
+        return [ name for name in all_methods(obj)
+                 if not self.filter_method( name ) ]
 
     def resolve( self, target, root ):
         """
         Validate and locate method targets in the form (name.)*method, returning
-        the named bound method.
+        the named bound method, or None if no method found.
 
-        The first time a "name.method" is encountered, and all available methods
-        are found and cached.  This also results in reference(s) to the object
-        being created, incrementing its refcount and preventing it from
+        The first time a "name.method" is encountered, all available methods in
+        "name.*" are found and cached.  This also results in reference(s) to the
+        object being created, incrementing its refcount and preventing it from
         disappearing.
 
-        We have to handle finding bound methods on objects, or simple functions
-        defined in the supplied root namespace.
+        We handle finding bound methods on objects, or simple functions defined
+        in the supplied root namespace, and avoiding re-searching the object
+        heirarchy every time an invalid method is requested.
         """
         method			= self.cache.get( target )
         if not method:
@@ -451,9 +469,9 @@ class server( object ):
             pathstr		= '.'.join( path )
             name		= terms[-1]
             if path:
-                # A path; A bound method of an object
+                # A path; Must be a bound method of an object
                 if pathstr not in self.cache:
-                    # ...and we haven't previously searched for this object.
+                    # ...and we haven't previously searched this object's methods.
                     self.cache[pathstr] = None
                     obj		= find_object( path, root )
                     if obj:
@@ -462,7 +480,7 @@ class server( object ):
                             self.cache[pathstr + '.' + m] = getattr( obj, m )
                         method	= self.cache.get( target )
             else:
-                # No path; A simple function in the root scope
+                # No path; Must be a simple function in the root scope
                 if not self.filter_method( name ):
                     method	= root.get( name )
             if not method:
@@ -590,3 +608,196 @@ class server_thread( server, stoppable ):
         server.__init__( self, root=root, socket=socket, latency=latency )
         stoppable.__init__( self, **kwargs )
 
+
+
+class client_session( client ):
+    """
+    Session allocating client.  At creation, one (of a possible pool of) remote
+    server_session is queried, and a session-specific socket are created, which
+    will be used for all RPC calls executed during the life of this object.  All
+    requests are serviced by a single thread on one of the remote servers.
+
+    Three sockets are used to establish, maintain and process RPCs.  First, we
+    request a session to be allocated, using the session_pool socket:
+
+        1) request a session from 1:M REQ:REP pool of server_session
+
+    We obtain a server socket that is connected to a remote server.  This is
+    used to verify the liveliness of that server(running in
+    a single thread), before returning our first 'client._remote' proxy
+    instance, and deallocate that remote server it at time of destruction.
+
+
+        2) receive address to establish server socket (for heartbeats,
+           management, server admin RPC), and session socket (for session RPC)
+
+        3) Obtain a XREQ socket connected to the server (if not already
+           connected), and proceed with heartbeats, admin RPC.
+
+        4) Obtain session XREQ socket (if not already connected), and proceed
+           with session RPC.
+           
+        
+    """
+    def __init__( self, socket, name="", context=None ):
+        """
+        This master socket is used only to request and establish the session's
+        server socket details.  This 1:M request may be received by 1 of many
+        server_sessions, who will in turn allocate a server for the exclusive
+        use of the client_session, 'til it is released, and return the details
+        required to establish a connection to it.
+
+        Since we cannot guarantee being able to ever reach the same peer using
+        the session socket, it is used exactly once; all further management of
+        the server and session is performed using the server or session
+        socket(s).
+        """
+        super( client_session, self ).__init__( socket=socket, name="self" )
+
+        self._context		= context or zmq.Context()
+        self._session		= None
+
+        # Allocate a server session for this client, blocking 'til available
+        # (Ensure object is fully initialized, so __getattr__ operates!)
+        address, session	= self.allocate()
+
+        sess_sock		= self._context.socket( zmq.XREQ )
+        sess_sock.connect( address )
+
+        
+        # TODO create a ping thread to monitor the health of this server.
+
+    def __del__( self ):
+        self.release( self._session )
+
+
+
+def logcall(format, *args):
+    def wrapper(method):
+        print ("%s: " + format) % tuple( method.__name__, *args )
+        return method
+    return wrapper
+
+# 
+# server_session_monitor
+# server_session_monitor_thread
+# 
+#     Remote validation of health of a server_session pool.
+# 
+# __init__:
+#     pool      -- the server_session pool to monitor
+# 
+# ping		-- RPC API; returns None if OK, exception on pool failure
+# 
+class server_session_monitor( server ):
+    """
+    This RPC server responds to ping requests, monitoring a server_session's
+    pool, to reassure the client_session that this server_session's session pool
+    is still active.  Cessation of pings will result in the harvesting and
+    reassignment of all sessions belonging to that client; ceasing to respond to
+    pings will result in the client_session aborting all sessions with this
+    server_session.
+    """
+    def __init__( self, pool, socket=None, latency=None ):
+        """
+        Remember the pool in an inaccessible member variable, and allow RPC
+        access only to local 'self'.
+        """
+        self._pool		= pool
+        super( server_session_monitor, self ).__init__(
+            root=locals(), socket=socket, latency=latency )
+        
+    def ping( self ):
+        print "ping: %s" % repr( self._pool )
+        pass
+
+class server_session_monitor_thread( server_session_monitor, stoppable ):
+    def __init__( self, pool, socket=None, latency=None, **kwargs ):
+        server_session_monitor.__init__(
+            self, pool=pool, socket=socket, latency=latency )
+        stoppable.__init__( self, **kwargs )
+
+# 
+# server_session
+# server_session_thread
+# 
+# __init__
+# 
+
+class server_session( server ):
+    """
+    Wait for session allocate() requests, assign a server, and return the tuple
+    containing: 
+      - the direct socket address to monitor this server_session
+      - the direct socket address to access the session's server
+    """
+    def __init__( self, root, context=None, socket=None, latency=None,
+                  pool=5, iface="localhost", port=None ):
+        super( server_session, self ).__init__( 
+            root=locals(), socket=socket, latency=latency )
+        
+        # The _monitor socket (bound on iface:port) is used for direct
+        # connection.  An integer port number is required, and all sockets will
+        # begin at that port number.
+        self._context		= context or zmq.Context()
+        self._monitor_addr	= "tcp://%s:%d" % ( iface, port )	
+        socket			= self._context.socket( zmq.XREP )
+        socket.bind( self._monitor_addr )
+        self._monitor		= server_session_monitor_thread(
+            pool=self, socket=socket, latency=latency )
+        self._idle		= {}
+
+        # Session server threads on subsequent ports, all with access to the
+        # 'root' dict of objects.
+        for n in xrange( 0, pool ):
+            socket		= self._context.socket( zmq.XREP )
+            addr		= "tcp://%s:%d" % ( iface, port + 1 + n )
+            socket.bind( addr )
+            self._idle[addr]	= server_thread( 
+                root=root, socket=socket, latency=latency )
+            self._idle[addr].start()
+
+    def threads( self ):
+        return [ self._monitor ] + self._idle.values()
+
+    def stop( self ):
+        """
+        Stop ourself, and all the threads we control
+        """
+        for t in self._threads():
+            t.stop()
+        super( server_session, self ).stop()
+
+    def join( self, *args, **kwargs ):
+        for t in self._threads():
+            t.join()
+        super( server_session, self ).join( *args, **kwargs )
+
+    # The server_session itself only responds to RPC requests to allocate new
+    # sessions.  The corresponding _release is issued (locally) by the session
+    # server thread, to put itself back in the pool.
+    def __dir__( self ):
+        """
+        Return only publicly accessible RPC methods via dir(...).
+        """
+        return [ "allocate" ]
+
+    #@logcall
+    def allocate( self ):
+        """
+        Return the 0MQ socket address of the server_session pool monitor, and
+        the specific session server allocated.
+        """
+        return self._monitor_addr, random.choice( self._idle.keys() )
+
+    #@logcall
+    def release( self, session ):
+        pass
+
+class server_session_thread( server_session, stoppable ):
+    def __init__( self, root, socket=None, latency=None,
+                  iface=None, port=None,  **kwargs ):
+        server_session.__init__(
+            self, root=root, socket=socket, latency=latency,
+            iface=iface, port=port)
+        stoppable.__init__( self, **kwargs )
