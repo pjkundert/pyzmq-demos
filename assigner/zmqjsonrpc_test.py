@@ -1,56 +1,102 @@
 import zmq
-import zmqjsonrpc
+import zmqjsonrpc as zjr
+import zhelpers
 import json
 import threading
+import time
+import traceback
 
-def test_zmqrpc_simulate_server():
-    clictx                      = zmq.Context()
-    cli                         = clictx.socket( zmq.XREQ )
-    cli.connect( 'tcp://localhost:11223' )
+port				= 11223
 
-    svrctx                      = zmq.Context()
-    svr                         = svrctx.socket( zmq.XREP )
-    svr.bind( 'tcp://*:11223' )
 
-    # Simulate the Server side of the 0MQ JSON-RPC request
-    def svrfun():
-        prefix, request         = svr.recv_multipart()
-        assert len( prefix ) == 1
-        assert len( request ) == 3
-        assert request[0].lower() == "1"     # Session ID
-        assert request[1].lower() == zmqjsonrpc.CONTENT_TYPE
-        sessid                  = request[0]
 
-        requestdict             = json.loads( request[2] )
-        assert requestdict['method'] == "boo.foo"
-        assert len( requestdict['params'] ) == 3
 
-        result                  = ", ".join( [ str( p )
-                                               for p in requestdict['params']] )
-        replydict               = {
-            "jsonrpc":          requestdict['jsonrpc'],
-            "id":               requestdict['id'],
-            "result":           result,
-            "error":            None,
-            }
-        svr.send_multipart( [sessid] + [json.dumps( replydict,
-                                                    **zmqjsonrpc.JSON_OPTIONS)],
-                            prefix=prefix )
+class Boo( object ):
+    def first( self, *args ):
+        return ", ".join( str( a ) for a in args )
 
-    svrthr                      = threading.Thread( target=svrfun )
+    second = first
+
+    def _hidden( self, *args ):
+        return "Can't run me!" + self.first( *args )
+
+boo				= Boo()
+
+
+def sub( lhs, rhs ):
+    return lhs - rhs
+
+def test_base_client():
+    global port
+    port		       += 1
+    
+    # Create 0MQ transport
+    context			= zmq.Context()
+    socket			= context.socket( zmq.REQ )
+
+    # Create the test server and connect client to it
+    svr				= context.socket( zmq.XREP )
+    svr.setsockopt( zmq.RCVTIMEO, 250 )
+    svr.bind( "tcp://*:%d" % ( port ))
+    socket.connect( "tcp://localhost:%d" % ( port ))
+
+    svrthr                      = zjr.server_thread( root=globals(), socket=svr )
     svrthr.start()
 
-    pxy                         = zmqjsonrpc.ServiceProxy(
-                                      socket=zmqjsonrpc.session_socket(
-                                          cli, sessid=["1"] ),
-                                      serviceName="boo" )
-    result                      = pxy.foo( 1, 2, 3 )
-    assert result == "1, 2, 3"
-    del pxy
+    # Create callable to method "first" and invoke; then "second"
+    remboo			= zjr.client( socket=socket, name="boo" )
+    result			= remboo.first( "some", "args" )
+    assert result == "some, args"
+    result			= remboo.second( "yet", "others" )
+    assert result == "yet, others"
+
+    # Try a global method
+    remgbl			= zjr.client( socket=socket )
+    result			= remgbl.sub( 42, 11 )
+    assert result == 31
+
+    # Various ways of failing to invoke nonexistent methods
+    for doit in [ 
+        lambda: remboo.nothere(),	# no such method
+        lambda: remboo._hidden(),	# Hidden method (leading '_')
+        lambda: remgbl.dir(),		# No such function
+        ]:
+        try:
+            result		= doit()
+            assert not "nonexistent method found: %s" % result
+        except Exception, e:
+            assert type(e) is zjr.Error
+            assert "Method not found" in str(e)
+            assert "-32601" in str(e)
+
 
     svrthr.join()
     svr.close()
-    svrctx.term()
-    cli.close()
-    clictx.term()
+    socket.close()
+    context.term()
 
+def test_session():
+    global port
+    port		       += 1
+    
+    # Create 0MQ transport
+    context			= zmq.Context()
+    socket			= context.socket( zmq.REQ )
+
+    # Create the test server and connect client to it
+    svr				= context.socket( zmq.XREP )
+    svr.setsockopt( zmq.RCVTIMEO, 250 )
+    svr.bind( "tcp://*:%d" % ( port ))
+    socket.connect( "tcp://localhost:%d" % ( port ))
+
+    # Create a server_session, allowing access to globals (including 'boo')
+    svrthr                      = zjr.server_session_thread(
+        root=globals(), socket=svr, iface="127.0.0.1", port=11245 )
+    svrthr.start()
+
+    # Create a client_session, attempting to access methods of "boo"
+    remses			= zjr.client_session( socket=socket, name="boo" )
+
+    result			= remses.first( "all", "good", "boys", 
+                                                "deserve", 1, "fudge" )
+    assert result == "all, good, boys, deserve, 1, fudge"

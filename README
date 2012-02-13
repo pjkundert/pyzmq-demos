@@ -3,6 +3,16 @@ Python ZeroMQ Demos
     These are my initial attempts to build some proof-of-concept
 experiments using 0MQ's Python bindings.
 
+WARNING
+
+    Due to the way CPython handles signals and the GIL, it is
+imperative that the main Python thread (the only thread that handles
+signals), is *not* used to run methods that may block for long periods
+(eg. thread.join(), mutex locks, etc.).  Do these things in other
+threads, leaving the Main thread open to handle signals (eg. SIGINT).
+From: http://www.dabeaz.com/python/GIL.pdf, page 25.
+
+
 
 
 pool
@@ -91,11 +101,11 @@ process, on the same box!)
    of the server thread.
 
 2a) Route messages from the client to the server via XREP/XREQ (NOTE reversal
-    from normal usage!)    The broker recognizes
+    from normal usage!) the broker recognizes.
 or
 
 2b) Create a PAIR socket, and connect directly to a specific server's public PAIR
-    socket.   Obviously, only 
+    socket.
 
  If we use straight 0MQ REQ/REP to select a server.  Problem is, the multitude
 of webserver processes must connect to the multitude of servers; we don't want
