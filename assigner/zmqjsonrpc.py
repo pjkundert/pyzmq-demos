@@ -370,61 +370,30 @@ class client( object ):
             return Error( error['code'], error.get('message'), error.get('data'))
 
 
-def find_object( names, root ):
-    """
-    Find the object identified by the list 'names', starting with the given root
-    {'name': object} dict, and searching down through the dir() of each named
-    sub-object.  Returns the final target object.
-    """
-    assert type( root ) is dict
-    attrs			= root.keys()
-    obj				= None
-    print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
-    for name in names:
-        if not obj:
-            # No object yet; use root dictionary provided
-            obj			= root.get( name )
-        else:
-            if name in dir( obj ):
-                obj		= getattr( obj, name )
-        if not obj:
-            break
-    return obj
-
-def all_methods(obj):
-    """
-    Return a list of names of methods of `obj` (from multiprocessing,
-    managers.py)
-    """
-    temp = []
-    for name in dir(obj):
-        func = getattr(obj, name)
-        if hasattr(func, '__call__'):
-            temp.append(name)
-    return temp
-
 class server( object ):
     """
-    Terminates RPC invocations to the subset of methods on the 'root' dictionary
-    of objects (eg. pass globals(), if the caller is guaranteed to be secure!);
-    the target object and methods are simply found by name.
+    Terminates RPC invocations to the subset of methods on the provided 'root'
+    dictionary of objects (eg. pass globals(), if the caller and network is
+    guaranteed to be secure!); the target object and methods are simply found by
+    name, by searching through the objects found in 'root'.
 
-    In the default implementation, all methods in a target object not beginning
-    with '_' are considered public (see multiprocessing/managers.py's
-    public_methods).  
+    In the default implementation, all callable attributes in a target object
+    returned by 'dir' and not beginning with '_' are considered public (see
+    multiprocessing, managers.py).
 
-    An object may customize __dir__ to limit method access, or you may override
-    and customize 'validate' to enforce some other access methodology.
+    A target object may customize __dir__ to limit method access.
+
+    Alternatively, you may override and customize 'find_object', 'all_methods',
+    'public_methods' or 'filter_method' to enforce some other object/method
+    access control methodology.
     """
-    def __init__( self, root=None, socket=None, latency=None ):
-        if root is None:
-            root		= locals
+    def __init__( self, root, socket=None, latency=None ):
+        assert type( root ) is dict
         self.root		= root
         self.poller		= zmq.core.poll.Poller()
         if socket:
             self.register( socket )
         self.latency		= float( latency or 0.25 )
-
         self.cache		= {}
 
     def register( self, socket ):
@@ -442,10 +411,43 @@ class server( object ):
     def public_methods( self, obj ):
         """
         Return a list of names of public methods of `obj`.
-        (from multiprocessing/managers.py)
+        (from multiprocessing, managers.py)
         """
-        return [ name for name in all_methods(obj)
+        return [ name for name in self.all_methods( obj )
                  if not self.filter_method( name ) ]
+
+    def all_methods( self, obj ):
+        """
+        Return a list of names of methods of `obj` (from multiprocessing,
+        managers.py).  Uses dir() 
+        """
+        temp 			= []
+        for name in dir( obj ):
+            func 		= getattr( obj, name )
+            if hasattr( func, '__call__' ):
+                temp.append( name )
+        return temp
+
+    def find_object( self, names, root ):
+        """
+        Find the object identified by the list 'names', starting with the given root
+        {'name': object} dict, and searching down through the dir() of each named
+        sub-object.  Returns the final target object.
+        """
+        assert type( root ) is dict
+        attrs			= root.keys()
+        obj			= None
+        print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
+        for name in names:
+            if not obj:
+                # No object yet; use root dictionary provided
+                obj		= root.get( name )
+            else:
+                if name in dir( obj ):
+                    obj		= getattr( obj, name )
+            if not obj:
+                break
+        return obj
 
     def resolve( self, target, root ):
         """
@@ -473,10 +475,9 @@ class server( object ):
                 if pathstr not in self.cache:
                     # ...and we haven't previously searched this object's methods.
                     self.cache[pathstr] = None
-                    obj		= find_object( path, root )
+                    obj		= self.find_object( path, root )
                     if obj:
-                        methods	= self.public_methods( obj )
-                        for m in methods:
+                        for m in self.public_methods( obj ):
                             self.cache[pathstr + '.' + m] = getattr( obj, m )
                         method	= self.cache.get( target )
             else:
@@ -486,6 +487,8 @@ class server( object ):
             if not method:
                 # Still not found; memoize as invalid method
                 self.cache[target] = None
+        print "server.resolve: %s ==> %s" % (
+            target, repr( method ) if method else "None, in " + repr( root.keys() ))
         return method
 
     def stopped( self ):
@@ -534,7 +537,7 @@ class server( object ):
         received		= socket.recv_multipart()
         separator		= received.index('')
         prefix			= received[:separator+1]
-        print "Server rx. [%s]" % (
+        print "Server rx: [%s]" % (
             ", ".join( [ zhelpers.format_part( m )
                          for m in received ] ))
         for request in received[separator+1:]:
@@ -576,7 +579,7 @@ class server( object ):
                 # Not a JSON-RPC Notification; append response for this request
                 replies.append( json.dumps( rpy, **JSON_OPTIONS ))
 
-        print "Server tx. [%s]" % (
+        print "Server tx: [%s]" % (
             ", ".join( [ zhelpers.format_part( m )
                          for m in prefix + replies ] ))
         socket.send_multipart( replies, prefix=prefix )
@@ -652,20 +655,25 @@ class client_session( client ):
         the server and session is performed using the server or session
         socket(s).
         """
-        super( client_session, self ).__init__( socket=socket, name="self" )
-
-        self._context		= context or zmq.Context()
-        self._session		= None
 
         # Allocate a server session for this client, blocking 'til available
-        # (Ensure object is fully initialized, so __getattr__ operates!)
-        address, session	= self.allocate()
+        monitor, session	= client( socket=socket, name="self" ).allocate()
 
-        sess_sock		= self._context.socket( zmq.XREQ )
-        sess_sock.connect( address )
+        # Open the sockets to the given server session, and the session pool monitor
+        if context is None:
+            context		= zmq.Context()
+        sess_sock		= context.socket( zmq.REQ )
+        sess_sock.connect( session )
 
-        
-        # TODO create a ping thread to monitor the health of this server.
+        # Ensure object is fully initialized, so __getattr__ operates, before
+        # using any object attributes!
+        super( client_session, self ).__init__( socket=sess_sock, name=name )
+
+        self._session		= session
+        self._monitor		= monitor
+
+        # TODO create a ping thread to ping the monitor, to track the health of
+        # this session's server.
 
     def __del__( self ):
         self.release( self._session )
@@ -705,8 +713,11 @@ class server_session_monitor( server ):
         """
         self._pool		= pool
         super( server_session_monitor, self ).__init__(
-            root=locals(), socket=socket, latency=latency )
-        
+            root={'self': self}, socket=socket, latency=latency )
+
+    def __dir__( self ):
+        return [ 'ping' ]
+
     def ping( self ):
         print "ping: %s" % repr( self._pool )
         pass
@@ -734,7 +745,7 @@ class server_session( server ):
     def __init__( self, root, context=None, socket=None, latency=None,
                   pool=5, iface="localhost", port=None ):
         super( server_session, self ).__init__( 
-            root=locals(), socket=socket, latency=latency )
+            root={ 'self': self }, socket=socket, latency=latency )
         
         # The _monitor socket (bound on iface:port) is used for direct
         # connection.  An integer port number is required, and all sockets will
@@ -745,6 +756,7 @@ class server_session( server ):
         socket.bind( self._monitor_addr )
         self._monitor		= server_session_monitor_thread(
             pool=self, socket=socket, latency=latency )
+        self._monitor.start()
         self._idle		= {}
 
         # Session server threads on subsequent ports, all with access to the
@@ -764,12 +776,12 @@ class server_session( server ):
         """
         Stop ourself, and all the threads we control
         """
-        for t in self._threads():
+        for t in self.threads():
             t.stop()
         super( server_session, self ).stop()
 
     def join( self, *args, **kwargs ):
-        for t in self._threads():
+        for t in self.threads():
             t.join()
         super( server_session, self ).join( *args, **kwargs )
 
@@ -780,7 +792,7 @@ class server_session( server ):
         """
         Return only publicly accessible RPC methods via dir(...).
         """
-        return [ "allocate" ]
+        return [ "allocate", "release" ]
 
     #@logcall
     def allocate( self ):
