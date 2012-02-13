@@ -642,6 +642,9 @@ class client_session( client ):
            
         
     """
+    # All client object's session pool monitors, keyed by monitor address.
+    _pools			= {}
+
     def __init__( self, socket, name="", context=None ):
         """
         This master socket is used only to request and establish the session's
@@ -656,34 +659,52 @@ class client_session( client ):
         socket(s).
         """
 
-        # Allocate a server session for this client, blocking 'til available
+        # Allocate a server session for this client, blocking 'til available.
+        # This is a one-shot request; client is discarded immediately after use,
+        # and socket is never used again.
         monitor, session	= client( socket=socket, name="self" ).allocate()
 
-        # Open the sockets to the given server session, and the session pool monitor
+        # Open the socket to the given server session allocated to this client.
+        # Ensure object is fully initialized, so __getattr__ operates, before
+        # using any object attributes!
         if context is None:
             context		= zmq.Context()
         sess_sock		= context.socket( zmq.REQ )
         sess_sock.connect( session )
-
-        # Ensure object is fully initialized, so __getattr__ operates, before
-        # using any object attributes!
         super( client_session, self ).__init__( socket=sess_sock, name=name )
 
         self._session		= session
+
+        # Open a socket to the monitor, if none already exists.
+
+        # TODO: clients sharing the same context share a common set of monitors.
+        moni			= self._pools.get( monitor )
+        if not moni:
+            moni_sock	        = context.socket( zmq.REQ )
+            moni_sock.connect( monitor )
+            self._pools[monitor]= client( socket=moni_sock, name="self" )
+
         self._monitor		= monitor
 
         # TODO create a ping thread to ping the monitor, to track the health of
         # this session's server.
 
     def __del__( self ):
-        self.release( self._session )
+        """
+        Ensure that the remote session pool is allowed to recycle the session.
+        """
+        moni			= self._pools.get( self._monitor )
+        if moni:
+            moni.release( self._session )
 
 
 
-def logcall(format, *args):
-    def wrapper(method):
-        print ("%s: " + format) % tuple( method.__name__, *args )
-        return method
+def logcall( method ):
+    def wrapper( *args, **kwargs ):
+        print "calling %s( %s )" % ( method.__name__, ", ".join(
+                [ str( a ) for a in args ]
+                + [ "%s=%s" % ( k, str( v )) for k, v in kwargs.items() ] ))
+        return method( *args, **kwargs )
     return wrapper
 
 # 
@@ -711,16 +732,21 @@ class server_session_monitor( server ):
         Remember the pool in an inaccessible member variable, and allow RPC
         access only to local 'self'.
         """
-        self._pool		= pool
+        self.pool		= pool
         super( server_session_monitor, self ).__init__(
             root={'self': self}, socket=socket, latency=latency )
 
     def __dir__( self ):
-        return [ 'ping' ]
+        return [ 'ping', 'release' ]
 
     def ping( self ):
         print "ping: %s" % repr( self._pool )
-        pass
+
+    def release( self, session ):
+        """
+        Explicit release of a session from a client.  Pass along to the pool.
+        """
+        self.pool.release( session )
 
 class server_session_monitor_thread( server_session_monitor, stoppable ):
     def __init__( self, pool, socket=None, latency=None, **kwargs ):
@@ -794,7 +820,7 @@ class server_session( server ):
         """
         return [ "allocate", "release" ]
 
-    #@logcall
+    @logcall
     def allocate( self ):
         """
         Return the 0MQ socket address of the server_session pool monitor, and
@@ -802,7 +828,7 @@ class server_session( server ):
         """
         return self._monitor_addr, random.choice( self._idle.keys() )
 
-    #@logcall
+    @logcall
     def release( self, session ):
         pass
 
