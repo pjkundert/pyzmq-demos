@@ -26,19 +26,18 @@ boo				= Boo()
 def sub( lhs, rhs ):
     return lhs - rhs
 
-def test_base_client():
+def test_rpc_base():
     global port
-    port		       += 1
     
     # Create 0MQ transport
     context			= zmq.Context()
     socket			= context.socket( zmq.REQ )
+    socket.connect( "tcp://localhost:%d" % ( port ))
 
     # Create the test server and connect client to it
     svr				= context.socket( zmq.XREP )
-    svr.setsockopt( zmq.RCVTIMEO, 250 )
     svr.bind( "tcp://*:%d" % ( port ))
-    socket.connect( "tcp://localhost:%d" % ( port ))
+    port		       += 1
 
     svrthr                      = zjr.server_thread( root=globals(), socket=svr )
     svrthr.start()
@@ -75,9 +74,8 @@ def test_base_client():
     socket.close()
     context.term()
 
-def test_session():
+def test_rpc_session():
     global port
-    port		       += 1
     
     # Create 0MQ transport
     context			= zmq.Context()
@@ -85,14 +83,18 @@ def test_session():
 
     # Create the test server and connect client to it
     svr				= context.socket( zmq.XREP )
-    svr.setsockopt( zmq.RCVTIMEO, 250 )
     svr.bind( "tcp://*:%d" % ( port ))
     socket.connect( "tcp://localhost:%d" % ( port ))
+    port		       += 1
+    pool			= 5
 
-    # Create a server_session, allowing access to globals (including 'boo')
+    # Create a server_session, allowing access to globals (including
+    # 'boo') Uses one port for the monitor socket, plus 'pool' ports
+    # for the server pool.
     svrthr                      = zjr.server_session_thread(
-        root=globals(), socket=svr, iface="127.0.0.1", port=11245 )
+        root=globals(), socket=svr, pool=pool, iface="127.0.0.1", port=11245 )
     svrthr.start()
+    port			+= 1 + pool
 
     # Create a client_session, attempting to access methods of "boo"
     remses			= zjr.client_session( socket=socket, name="boo" )

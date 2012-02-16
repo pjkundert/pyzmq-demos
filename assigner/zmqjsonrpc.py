@@ -10,14 +10,14 @@
 # functionality for implementing RPC-like client proxies and servers.  Not close
 # to plug-in compatible with json-rpc.
 # 
-#     The problem with 0MQ is that it is not connection oriented in the
-# traditional TCP/IP or even UDP/IP sense; with some configuration changes, 0 or
-# more client 0MQ REQ sockets may be connected to 0 or more server 0MQ REP
-# sockets, with our without intervening 0MQ router/dealer brokers in between.
-# Furthermore, there is no notification when clients and/or servers appear or
-# disappear, making some traditional RPC requirements (eg. failure on connection
-# disappearance) possible.  Basically, as the 0MQ designers say "RPC is a leaky
-# abstraction".  
+#     The architectural difference with 0MQ is that it is not connection
+# oriented in the traditional TCP/IP or even UDP/IP sense; with some
+# configuration changes, 0 or more client 0MQ REQ sockets may be connected to 0
+# or more server 0MQ REP sockets, with or without intervening 0MQ router/dealer
+# brokers in between.  Furthermore, there is no notification when clients and/or
+# servers appear or disappear, making some traditional RPC requirements
+# (eg. failure on connection disappearance) impossible.  Basically, as the 0MQ
+# designers say "RPC is a leaky abstraction".
 # 
 #     You may *believe* that an interface using a network connected RPC
 # interface is "just like" your original in-process procedure call based
@@ -37,7 +37,7 @@
 #     If multiple addresses are configured, then each client will explicitly
 #     connect its request port to all of them.  Each request will be received
 #     and processed by an arbitrary server, in a round-robin fashion.  0MQ will
-#     route the request back to the correct client.
+#     route the request's response back to the correct client.
 # 
 # o Detect server liveness sending (and responding to) pings on server socket
 # 
@@ -65,8 +65,9 @@
 #     remote server thread.  Supports the acquisition of a server and allocation
 #     of a session key, and creation of a separate channel to that server for
 #     processing of subsequent requests within that session.  This allows all
-#     requests to hit the same server, and allows that server to ensure that the
-#     same thread processes all requests with that session key.
+#     requests to hit the same server thread, and allows that server pool to
+#     ensure that the same server thread remains allocated to processes all
+#     requests for that session key, until the server is released to the pool.
 # 
 # o Broadcast requests
 # 
@@ -81,24 +82,25 @@
 #   - Block on all servers, while sending/receiving pings to ensure liveness
 # 
 # 
-# ServiceProxy( socket[, serviceName[, requestId )
+# client( socket, name )
 # 
-#     Creates a proxy for the named object (optional; default None
-#     invokes global methods).  Invoking:
+#     Creates a proxy object for the named remote method (optional; default
+# name="" invokes only "global" methods (methods directly in the 'root' dictionary
+# supplied to the server).  Invoking:
 # 
-#          <proxy>.method(<params>)
+#          <proxy>.method( <params> )
 # 
-#     Sends the 0MQ 2-part message: 'content-type: application/json',
-# followed by a JSON-RPC 2.0 encoded remote method invocation of:
+#     Sends a 0MQ message containing a JSON-RPC 2.0 encoded remote method
+# invocation of:
 #     
-#          [serviceName.]method(<params>)
+#          [name.]method( <params> )
 # 
-#     The result (or exception, raised as a JSONRPCException) is
-# returned via JSON-RPC encoding.
+#     The result (or exception, raised as a JSONRPCException) is returned via
+# JSON-RPC encoding.
 # 
 # 0MQ JSON-RPC Protocol
 # 
-#     The zmqjsonrpc's ServiceProxy expects a zmq.REQ/REP type socket, where
+#     The zmqjsonrpc's client object expects a zmq.REQ type socket, where
 # .recv_multipart yields exactly the original list passed to .send_multipart:
 # 
 #         Client                           Server
@@ -109,8 +111,9 @@
 #                                       -  '{"result":...}'
 #         '{"result":...}'           <-'
 # 
-# This simple 0MQ REQ/REP socket pair can support simple, traditional 1:1 RPC.
-# As expected, it is the simplest to set up and use.  It has certain limitations:
+#     This simple 0MQ REQ/[X]REP socket pair can support simple, traditional 1:1
+# RPC.  As expected, it is the simplest to set up and use.  It has certain
+# limitations:
 # 
 #     o Since 0MQ doesn't report socket disconnections, it is not possible for
 #       the client to detect that a server has died after sending it a request.
@@ -228,9 +231,9 @@ MESSAGES 			= {
 
 class Error( Exception ):
     """
-    Errors transported from the remote side include an error code.  The __dict__
-    is appropriate for directly encoding as the error: value in a JSON-RPC
-    response:
+    Errors transported from the remote side include an error code and message.
+    Error.__dict__ is appropriate for directly encoding as the 'error': value in
+    a JSON-RPC response:
     
         >>> zmqjsonrpc.Error(-32700).__dict__
         {'code': -32700, 'message': 'Parse error'}
@@ -260,6 +263,7 @@ class Error( Exception ):
 # 
 # client_session	-- allocates a session for duration of client
 # server_session	-- provides sessions over a pool of servers
+# server_session_thread	-- a stoppable Thread implement a server_session
 # 
 
 class client( object ):
@@ -333,8 +337,8 @@ class client( object ):
     class _remote( object ):
         """
         Capture an RPC API method as a callable.  When invoked, arguments are
-        encoded using JSON-RPC conventions; transport and collect result, raises
-        Error exception on any remote error.
+        encoded using JSON-RPC conventions; transports request and collects
+        result, raises Error exception on any remote error.
 
         Generally meant to be invoked once, but could be bound to a local and
         invoked repeatedly; generates appropriate sequence of unique request ids
@@ -364,7 +368,8 @@ class client( object ):
 
         def exception( self, reply ):
             """
-            Handles a reply error, and returns the appropriate local Exception.
+            Handles a JSON-RPC reply 'error': value, and returns the appropriate
+            local Exception instance.
             """
             error		= reply['error']
             return Error( error['code'], error.get('message'), error.get('data'))
@@ -395,6 +400,13 @@ class server( object ):
             self.register( socket )
         self.latency		= float( latency or 0.25 )
         self.cache		= {}
+
+    def cleanup( self ):
+        """
+        Clean up anything that may prevent tidy shutdown (eg. prevent the Thread
+        from terminating, such as open 0MQ sockets or contexts)
+        """
+        del self.poller
 
     def register( self, socket ):
         """
@@ -506,9 +518,12 @@ class server( object ):
         If combined with a threading.Thread (eg. stoppable) in a derived class,
         this method will process incoming RPC requests 'til stopped.
         """
+        print "%s.run w/ latency=%s" % ( self, self.latency )
         while not self.stopped():
             for socket, _ in self.poller.poll( timeout=self.latency ):
                 self.process( socket )
+        print "%s.run complete" % ( self )
+        self.cleanup()
 
     def error( self, exception, request ):
         """
@@ -592,9 +607,11 @@ class stoppable( threading.Thread ):
     def __init__( self, *args, **kwargs ):
         self.__stop	 	= threading.Event()
         super( stoppable, self ).__init__( *args, **kwargs )
+        print "%s.__init__" % ( self )
 
     def stop( self ):
         self.__stop.set()
+        print "%s.stop" % ( self )
 
     def stopped( self ):
         return self.__stop.is_set()
@@ -794,19 +811,15 @@ class server_session( server ):
             self._idle[addr]	= server_thread( 
                 root=root, socket=socket, latency=latency )
             self._idle[addr].start()
+        socket			= None
 
     def threads( self ):
         return [ self._monitor ] + self._idle.values()
 
-    def stop( self ):
-        """
-        Stop ourself, and all the threads we control
-        """
-        for t in self.threads():
-            t.stop()
-        super( server_session, self ).stop()
-
     def join( self, *args, **kwargs ):
+        """
+        Will also stop ourself, and all the threads we control
+        """
         for t in self.threads():
             t.join()
         super( server_session, self ).join( *args, **kwargs )
@@ -834,7 +847,7 @@ class server_session( server ):
 
 class server_session_thread( server_session, stoppable ):
     def __init__( self, root, socket=None, latency=None,
-                  iface=None, port=None,  **kwargs ):
+                  pool=5, iface=None, port=None,  **kwargs ):
         server_session.__init__(
             self, root=root, socket=socket, latency=latency,
             iface=iface, port=port)

@@ -1,19 +1,19 @@
 import zmq
 import zhelpers
 
-port			= 55667
+port				= 55667
 
 def test_closing_full():
-    ctx			= zmq.Context()
-    ver			= zmq.zmq_version()[:3]
+    ctx				= zmq.Context()
+    ver				= zmq.zmq_version()[:3]
 
     global port
-    port	       += 1
-    out 		= ctx.socket( zmq.XREQ )
+    out 			= ctx.socket( zmq.XREQ )
     out.bind( "tcp://*:%d" % port )
 
-    inc			= ctx.socket( zmq.XREP )
+    inc				= ctx.socket( zmq.XREP )
     inc.connect( "tcp://localhost:%d" % port )
+    port	       	       += 1
 
     try:
         # Test that ..._multipart and zmq.RCVMORE behave as we think
@@ -29,8 +29,8 @@ def test_closing_full():
             assert False and "Unknown zmq version"
         
         out.send_multipart( ['', 'TEST2'] )
-        msg 		= []
-        poller		= zmq.Poller()
+        msg 			= []
+        poller			= zmq.Poller()
         poller.register(inc, zmq.POLLIN)
         while poller.poll( timeout=100 ):
             msg.append( inc.recv() )
@@ -40,12 +40,12 @@ def test_closing_full():
         
         ## Add another stage; see if we can intercept and re-route between
         ## inc/nxt
-        #port	       += 1
         #nxt			= ctx.socket( zmq.XREQ )
         #nxt.connect( "tcp://localhost:%d" % port )
         #
         #lst			= ctx.socket( zme.XREP )
         #nxt.bind( "tcp://*:%d" % port )
+        #port	       	       += 1
         
     finally:
         out.close()
@@ -74,11 +74,10 @@ def test_sending_receiver_ids():
     being a blank message entry, and maintains the value of the request ID label
     entry.
     """
-    ctx			= zmq.Context()
-    ver			= zmq.zmq_version()[:3]
+    ctx				= zmq.Context()
+    ver				= zmq.zmq_version()[:3]
 
     global port
-    port	       += 1
 
     xrepb		= ctx.socket( zmq.XREP )
     xrepb.bind( "tcp://*:%d" % port )
@@ -88,6 +87,7 @@ def test_sending_receiver_ids():
 
     xrepa		= ctx.socket( zmq.XREP )
     xrepa.connect( "tcp://localhost:%d" % port )
+    port	       	       += 1
 
     try:
         # From XREQ, XREP(B) will add a source socket ID on recv...
@@ -108,10 +108,10 @@ def test_sending_receiver_ids():
         
         # Try using that socket ID as a destination for routing to the same XREP(B)
         # from XREP(A)
-        poller = zmq.Poller()
+        poller 			= zmq.Poller()
         poller.register( xrepb, zmq.POLLIN)
         xrepa.send_multipart( rx )
-        socks = dict(poller.poll( timeout=1000 ))
+        socks 			= dict(poller.poll( timeout=1000 ))
         # Nope.  Different IDs assigned by each connector, for the
         # same remote socket
         assert len( socks ) == 0
