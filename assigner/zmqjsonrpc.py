@@ -139,10 +139,15 @@
 # the corresponding reply back to the correct client.
 # 
 # 
+# Multiple Independent Client Requests with Same Server
+# 
 #     There may be reason to add yet further data to the messages transmitted
-# over the socket's stream; to assist in establishing sessions (eg. if the
-# destination socket is shared by multiple separate sessions within the same
-# client):
+# over the socket's stream; to assist in establishing independent client
+# sessions (eg. if the destination socket is shared by multiple separate
+# sessions, or sequential threads invoking RPCs, within the same client).  This
+# could be accomblished by modifying the client to transmit a session key with
+# each request, and modifying the server to remember and return the session key,
+# and even to multiplex incoming requests to separate threads if desired:
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
@@ -151,50 +156,58 @@
 #                                       -  <cli> '' <s#1> '{"result"...}'
 #         <s#1> '{"result"...}'      <-'
 # 
-# Now, an X*M:1 scenario is supported, where X sessions (threads?), in each of M
-# clients, can send RPC requests to 1 server, and the results are sent back to
-# the correct client, and then to the correct session/thread within the client.
-# This also supports simple X*M:N RPC, if the client connects its zmq.REQ socket
-# to multiple server zmq.XREP sockets; however.  Each request would be routed to
-# a random server, which is satisfactory for many applications.
+#     This would support an X*M:1 scenario, where X sessions (threads?), in each
+# of M clients, can send RPC requests to 1 server, and the results are sent back
+# to the correct client, and then to the correct session/thread within the
+# client.  This also supports simple X*M:N RPC, if the client connects its
+# zmq.REQ socket to multiple server zmq.XREP sockets; however.  Each separate
+# RCP request would be routed to a random server, which is satisfactory for many
+# applications.
 # 
 # 
-#     To support a more strict X*M:N scenario (multiple sessions/client,
-# multiple clients, and multiple servers) with strict session/server-thread
-# allocation, another layer is required.  The Client must request a server,
-# using a 1:N channel (eg. REQ/REP, where the client REQ binds, and all the
-# server REPs connect, or where the client REQ connects to each of the multiple
-# server REP socket bind addresses).  The client then obtains a session ID and
-# socket address:
+# Sessions with Server Thread Assignment
+# 
+#     To support a more strict X*M:N scenario (multiple sessions per client,
+# multiple clients, and multiple servers) with strict session and server-thread
+# allocation, another layer is required.  The Client must request a server
+# assignment using an M:N channel (eg. REQ/REP, where the client REQ binds, and
+# all the server REPs connect, or where the client REQ connects to each of the
+# multiple server REP socket bind addresses, or an intervening Router/Dealer
+# distributes all incoming connected client requests to all available connected
+# servers).  The client requests and obtains a monitor socket address and a
+# server socket address:
 # 
 #         zmq.REQ                          zmq.XREP
 #         -------                          ------
 #         ''                          -
 #                                      `-> <cli> '' ''
-#                                       -  <cli> '' <key> <addr>
-#         <key> <addr>               <-'
+#                                       -  <cli> '' <mon> <svr>
+#         <mon> <svr>                <-'
 # 
-# The client then creates a new zmq.REQ socket connected to the provided address
-# (if one not already existing), and then uses it to perform X*M:1 RPC.  The
+# The client then creates a new zmq.REQ socket connected to the provided addresses
+# (if one not already existing), and then uses it to perform 1:1 RPC.  The
 # supplied session key is used to associate all client session requests with the
 # same server session/thread.
-# 
-#         zmq.REQ                          zmq.XREP
+#                                          
+#         zmq.REQ (to <svr>)               zmq.XREP (<svr>)
 #         -------                          ------
-#         <key> '{"jsonrpc"...}'      -
-#                                      `-> <cli> '' <key> '{"jsonrpc"...}'
-#                                       -  <cli> '' <key> '{"result"...}'
-#         <key> '{"result"...}'      <-'
+#         '{"jsonrpc"...}'            -
+#                                      `-> <cli> '' '{"jsonrpc"...}'
+#                                       -  <cli> '' '{"result"...}'
+#         '{"result"...}'            <-'
 # 
-# The end of the session is denoted with an empty request:
+# The end of the session is denoted with an request to .release on the monitor
+# socket:
+#                                          
+#         zmq.REQ (to <mon>)               zmq.XREP (<mon>)
+#         -------                          ------
+#         '{"jsonrpc"...}'            -
+#                                      `-> <cli> '' '{"jsonrpc"...}'
+#                                       -  <cli> '' '{"result"...}'
+#         '{"result"...}'            <-'
 # 
-#         <key>                       -
-#                                      `-> <cli> '' <key>
-#                                       -  <cli> '' <key>
-#         <key>                      <-'
-# 
-# allowing the server to return the session's resources (eg. thread) to the
-# pool.
+# allowing the server pool's monitor to return the session's resources (the
+# assigned server thread) to the pool.
 # 
 
 
@@ -279,15 +292,15 @@ class client( object ):
         # Create 0MQ transport
         context		= zmq.Context()
         socket		= context.socket( zmq.REQ )
+        socket.connect( "<server-address>" )
         remote		= client( socket=socket, name="boo" )
 
         # Create callable to method "first" and invoke; then "second"
         result1		= remote.first( "some", "args" )
         result2		= remote.second( "yet", "others" )
 
-        # Clean up; destroy proxy, then close sockets, terminate context
+        # Clean up; destroy proxy (closes socket), terminate context
         del remote
-        socket.close()
         context.term()
 
     Any instance attribute not found is assumed to be a remote method, and
@@ -305,6 +318,14 @@ class client( object ):
         self.socket		= socket
         self.name		= name
         self._request_id	= 0
+
+    def __del__( self ):
+        self._cleanup()
+
+    def _cleanup( self ):
+        if self.socket:
+            self.socket.close()
+            self.socket		= None
 
     def _request( self ):
         """
@@ -396,21 +417,32 @@ class server( object ):
         assert type( root ) is dict
         self.root		= root
         self.poller		= zmq.core.poll.Poller()
-        if socket:
-            self.register( socket )
+        self.socket		= socket
+        if self.socket:
+            self.register( self.socket )
         self.latency		= float( latency or 0.25 )
         self.cache		= {}
+
+    def __del__( self ):
+        self.cleanup()
 
     def cleanup( self ):
         """
         Clean up anything that may prevent tidy shutdown (eg. prevent the Thread
-        from terminating, such as open 0MQ sockets or contexts)
+        from terminating, such as open 0MQ sockets or contexts).  Any socket
+        passed to constructor is assumed to be owned by the server, and is
+        closed; use 'register' to add externally managed sockets.  Ensure safe
+        and repeatable behaviour, because it may be invoked multiple times.
         """
-        del self.poller
+        self.poller = None
+        if self.socket:
+            self.socket.close()
+            self.socket = None
 
     def register( self, socket ):
         """
-        Add another socket that we can receive incoming RPC requests on.
+        Add another socket that we can receive incoming RPC requests on.  These
+        sockets' scopes are assumed to be manage externally.
         """
         self.poller.register( socket, zmq.POLLIN )
 
@@ -503,28 +535,6 @@ class server( object ):
             target, repr( method ) if method else "None, in " + repr( root.keys() ))
         return method
 
-    def stopped( self ):
-        """
-        Use a superclass 'stopped' method if available, otherwise never stop.
-        """
-        try:
-            return super( server, self ).stopped()
-        except:
-            pass
-        return False
-
-    def run( self ):
-        """
-        If combined with a threading.Thread (eg. stoppable) in a derived class,
-        this method will process incoming RPC requests 'til stopped.
-        """
-        print "%s.run w/ latency=%s" % ( self, self.latency )
-        while not self.stopped():
-            for socket, _ in self.poller.poll( timeout=self.latency ):
-                self.process( socket )
-        print "%s.run complete" % ( self )
-        self.cleanup()
-
     def error( self, exception, request ):
         """
         Handle arbitrary server-side method exception 'exc', produced by the
@@ -598,7 +608,15 @@ class server( object ):
             ", ".join( [ zhelpers.format_part( m )
                          for m in prefix + replies ] ))
         socket.send_multipart( replies, prefix=prefix )
-                
+
+    def receive( self ):
+        """
+        Receives and processes incoming requests until the predefined timeout
+        has passed with no activity.
+        """
+        for socket, _ in self.poller.poll( timeout=self.latency ):
+            self.process( socket )
+        
 
 class stoppable( threading.Thread ):
     """
@@ -620,14 +638,31 @@ class stoppable( threading.Thread ):
         self.stop()
         super( stoppable, self ).join( *args, **kwargs )
 
-class server_thread( server, stoppable ):
+
+class server_thread_base( stoppable ):
     """
-    A JSON-RPC server Thread class that stops when joined.
+    If combined with a server-derived class, this method will process server's
+    incoming RPC requests 'til stopped.
+    """
+    def __init__( self, **kwargs ):
+        stoppable.__init__( self, **kwargs )
+
+    def run( self ):
+        print "%s.run w/ latency=%s" % ( self, self.latency )
+        while not self.stopped():
+            self.receive()
+        print "%s.run complete" % ( self )
+        self.cleanup()
+
+
+class server_thread( server, server_thread_base ):
+    """
+    A JSON-RPC server Thread, which receives requests, and stops (within the
+    server's predefined 'latency') when joined.
     """
     def __init__( self, root, socket=None, latency=None, **kwargs ):
         server.__init__( self, root=root, socket=socket, latency=latency )
-        stoppable.__init__( self, **kwargs )
-
+        server_thread_base.__init__( self, **kwargs )
 
 
 class client_session( client ):
@@ -751,7 +786,7 @@ class server_session_monitor( server ):
         """
         self.pool		= pool
         super( server_session_monitor, self ).__init__(
-            root={'self': self}, socket=socket, latency=latency )
+            root={ 'self': self }, socket=socket, latency=latency )
 
     def __dir__( self ):
         return [ 'ping', 'release' ]
@@ -765,11 +800,11 @@ class server_session_monitor( server ):
         """
         self.pool.release( session )
 
-class server_session_monitor_thread( server_session_monitor, stoppable ):
+class server_session_monitor_thread( server_session_monitor, server_thread_base ):
     def __init__( self, pool, socket=None, latency=None, **kwargs ):
         server_session_monitor.__init__(
             self, pool=pool, socket=socket, latency=latency )
-        stoppable.__init__( self, **kwargs )
+        server_thread_base.__init__( self, **kwargs )
 
 # 
 # server_session
@@ -843,12 +878,13 @@ class server_session( server ):
 
     @logcall
     def release( self, session ):
+        print "Releasing session: %s" % ( session )
         pass
 
-class server_session_thread( server_session, stoppable ):
+class server_session_thread( server_session, server_thread_base ):
     def __init__( self, root, socket=None, latency=None,
                   pool=5, iface=None, port=None,  **kwargs ):
         server_session.__init__(
             self, root=root, socket=socket, latency=latency,
-            iface=iface, port=port)
-        stoppable.__init__( self, **kwargs )
+            pool=pool, iface=iface, port=port)
+        server_thread_base.__init__( self, **kwargs )
