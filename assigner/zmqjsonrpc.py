@@ -226,21 +226,34 @@ JSON_OPTIONS                    = {
     "allow_nan":        True,           # Allow nan/inf to be encoded
     }
 
-PARSE_ERROR			= -32700
-INVALID_REQUEST			= -32600
-METHOD_NOT_FOUND		= -32601
-INVALID_PARAMS			= -32602
-INTERNAL_ERROR			= -32603
-SERVER_ERROR			= -32000
+PARSE_ERROR                     = -32700
+INVALID_REQUEST                 = -32600
+METHOD_NOT_FOUND                = -32601
+INVALID_PARAMS                  = -32602
+INTERNAL_ERROR                  = -32603
+SERVER_ERROR                    = -32000
 
-MESSAGES 			= {	
-    PARSE_ERROR:	"Parse error",
-    INVALID_REQUEST:	"Invalid Request",
-    METHOD_NOT_FOUND:	"Method not found",
-    INVALID_PARAMS:	"Invalid params",
-    INTERNAL_ERROR:	"Internal error",
-    SERVER_ERROR:	"Server error",
+MESSAGES                        = {     
+    PARSE_ERROR:        "Parse error",
+    INVALID_REQUEST:    "Invalid Request",
+    METHOD_NOT_FOUND:   "Method not found",
+    INVALID_PARAMS:     "Invalid params",
+    INTERNAL_ERROR:     "Internal error",
+    SERVER_ERROR:       "Server error",
 }
+
+
+def logcall( method ):
+    """
+    @logcall    -- decorator to log method invocations
+    """
+    def wrapper( *args, **kwargs ):
+        print "calling %s( %s )" % ( method.__name__, ", ".join(
+                [ str( a ) for a in args ]
+                + [ "%s=%s" % ( k, str( v )) for k, v in kwargs.items() ] ))
+        return method( *args, **kwargs )
+    return wrapper
+
 
 class Error( Exception ):
     """
@@ -255,12 +268,12 @@ class Error( Exception ):
     containing additional details of the error.
     """
     def __init__( self, code, message=None, data=None ):
-        self.code		= code
+        self.code               = code
         if message is None:
-            message		= MESSAGES.get( code, "Unknown error code" )
-        self.message		= message
+            message             = MESSAGES.get( code, "Unknown error code" )
+        self.message            = message
         if data:
-            self.data		= data
+            self.data           = data
 
     def __str__( self ):
         if hasattr( self, 'data' ) and self.data:
@@ -270,34 +283,35 @@ class Error( Exception ):
 # 
 # 0MQ JSON-RPC
 # 
-# client		-- zmq.REQ basic blocking client
-# server		-- zmq.XREP basic blocking server
-# server_thread		-- a stoppable Thread implementing a server
+# client                -- zmq.REQ basic blocking client
+# server                -- zmq.XREP basic blocking server
+# server_thread         -- a stoppable Thread implementing a server
 # 
-# client_session	-- allocates a session for duration of client
-# server_session	-- provides sessions over a pool of servers
-# server_session_thread	-- a stoppable Thread implement a server_session
+# client_session        -- allocates a session for duration of client
+# server_session        -- provides sessions over a pool of servers
+# server_session_thread -- a stoppable Thread implement a server_session
 # 
 
 class client( object ):
     """
-    Proxy object to initiate RPC invocations to any non-'_...' method; blocking,
-    no timeouts.  Default _transport assumes that the provided 0MQ socket strips
-    off any routing prefix before delivering payload.
+    Proxy object to initiate RPC invocations on the remote server object called
+    "name", to any method not beginning with '_'; blocking, no timeouts.
+    Default _transport assumes that the provided 0MQ socket strips off any
+    routing prefix before delivering payload (such as zmq.REQ does).
 
-    Not threadsafe; all invocations are assumed to be serialized.
+    Not threadsafe; all invocations are assumed to be serialized on the client.
 
     EXAMPLE
 
         # Create 0MQ transport
-        context		= zmq.Context()
-        socket		= context.socket( zmq.REQ )
+        context         = zmq.Context()
+        socket          = context.socket( zmq.REQ )
         socket.connect( "<server-address>" )
-        remote		= client( socket=socket, name="boo" )
+        remote          = client( socket=socket, name="boo" )
 
-        # Create callable to method "first" and invoke; then "second"
-        result1		= remote.first( "some", "args" )
-        result2		= remote.second( "yet", "others" )
+        # Creates callable to method "first" and invokes; then "second"
+        result1         = remote.first( "some", "args" )
+        result2         = remote.second( "yet", "others" )
 
         # Clean up; destroy proxy (closes socket), terminate context
         del remote
@@ -314,22 +328,23 @@ class client( object ):
     def __init__( self, socket, name="" ):
         """
         Make a proxy for the object "name" on the other end of "socket".
+        Assumes control of provided socket, closing it on destruction.
         """
-        self.socket		= socket
-        self.name		= name
-        self._request_id	= 0
+        self._socket            = socket
+        self._name              = name
+        self._request_id        = 0
 
     def __del__( self ):
         self._cleanup()
 
     def _cleanup( self ):
-        if self.socket:
-            self.socket.close()
-            self.socket		= None
+        if self._socket:
+            self._socket.close()
+            self._socket        = None
 
     def _request( self ):
         """
-        Always return a unique request ID for anything using this instance.
+        Always returns a unique request ID for anything using this instance.
         """
         self._request_id        += 1
         return self._request_id
@@ -337,63 +352,63 @@ class client( object ):
     def _transport( self, request ):
         """
         Marshall and send JSON request, blocking for result.  This is the
-        transport underlying the callables produced.  Override this to implement
-        different RPC transports or encodings.
+        default transport underlying the callables produced.  Override this to
+        implement different RPC transports or encodings.
         """
-        self.socket.send_multipart( [ json.dumps( request ) ] )
-        response		= self.socket.recv_multipart()
+        self._socket.send_multipart( [ json.dumps( request ) ] )
+        response                = self._socket.recv_multipart()
         assert len( response ) == 1
         return json.loads( response[0] )
-                
-    def __getattr__( self, method ):
-        """
-        Prepare to invoke name.method.  Returns callable bound to remote method,
-        using our transport and sequence of unique request IDs.   
-        """
-        print "__getattr__: %s" % ( method )
-        return self._remote(
-            method='.'.join( [ n for n in [ self.name, method ] if n ] ),
-            transport=self._transport, request=self._request )
 
-    class _remote( object ):
+    def _error( self, reply ):
         """
-        Capture an RPC API method as a callable.  When invoked, arguments are
-        encoded using JSON-RPC conventions; transports request and collects
-        result, raises Error exception on any remote error.
-
-        Generally meant to be invoked once, but could be bound to a local and
-        invoked repeatedly; generates appropriate sequence of unique request ids
-        for each invocation.
+        Handles a JSON-RPC reply 'error': value, and returns the appropriate
+        local Exception instance.
         """
-        def __init__( self, method, transport, request ):
-            self.method		= method
-            self.transport	= transport
-            self.request	= request
+        error               = reply['error']
+        return Error( error['code'], error.get('message'), error.get('data'))
+        
 
-        def __call__( self, *args ):
+    def __getattr__( self, attr ):
+        """
+        Prepare to invoke remote "[name.]attr".  Produces and returns a closure
+        implementing a callable proxy bound to a remote method, using our
+        object's _transport, unique _request ID generator, and _error method.
+
+        Override to implement alternative encodings and/or transports.
+        """
+        def proxy( *args ):
             """
             Encodes the call into a JSON-RPC style request, transports it,
             ensuring result has matching request id.
+
+            Capture an RPC API method as a callable.  When invoked, arguments
+            are encoded using JSON-RPC conventions; transports request and
+            collects result, raises Error exception on any remote error.
+            
+            Generally meant to be invoked once and discarded, but can be saved
+            and invoked repeatedly; generates the appropriate sequence of unique
+            request ids for each invocation, using the supplied 'request'
+            method.
+            
+            Any exceptions due to local issues (marshalling or unmarshalling
+            data, invalid request IDs, etc. result in native local exceptions.
+            All exceptions reported by the RPC server result in a
+            zmqjsonrpc.Error exception.  Override
             """
-            request		= {
-                'jsonrpc':	"2.0",
-                'id':		self.request(),
-                'method': 	self.method,
-                'params':	args,
+            request             = {
+                'jsonrpc':      "2.0",
+                'id':           self._request(),
+                'method':       attr if not self._name else self._name + '.' + attr,
+                'params':       args,
                 } 
-            reply		= self.transport( request )
+            reply               = self._transport( request )
             if reply['error']:
-                raise self.exception( reply )
+                raise self._error( reply )
             assert reply['id'] == request['id']
             return reply['result']
-
-        def exception( self, reply ):
-            """
-            Handles a JSON-RPC reply 'error': value, and returns the appropriate
-            local Exception instance.
-            """
-            error		= reply['error']
-            return Error( error['code'], error.get('message'), error.get('data'))
+            
+        return proxy
 
 
 class server( object ):
@@ -415,13 +430,13 @@ class server( object ):
     """
     def __init__( self, root, socket=None, latency=None ):
         assert type( root ) is dict
-        self.root		= root
-        self.poller		= zmq.core.poll.Poller()
-        self.socket		= socket
+        self.root               = root
+        self.poller             = zmq.core.poll.Poller()
+        self.socket             = socket
         if self.socket:
             self.register( self.socket )
-        self.latency		= float( latency or 0.25 )
-        self.cache		= {}
+        self.latency            = float( latency or 0.25 )
+        self.cache              = {}
 
     def __del__( self ):
         self.cleanup()
@@ -437,7 +452,7 @@ class server( object ):
         self.poller = None
         if self.socket:
             self.socket.close()
-            self.socket = None
+            self.socket         = None
 
     def register( self, socket ):
         """
@@ -465,9 +480,9 @@ class server( object ):
         Return a list of names of methods of `obj` (from multiprocessing,
         managers.py).  Uses dir() 
         """
-        temp 			= []
+        temp                    = []
         for name in dir( obj ):
-            func 		= getattr( obj, name )
+            func                = getattr( obj, name )
             if hasattr( func, '__call__' ):
                 temp.append( name )
         return temp
@@ -479,16 +494,16 @@ class server( object ):
         sub-object.  Returns the final target object.
         """
         assert type( root ) is dict
-        attrs			= root.keys()
-        obj			= None
-        print "finding '%s' in [%s]" % ( '.'.join( names ), ', '.join( attrs ))
+        attrs                   = root.keys()
+        obj                     = None
+
         for name in names:
             if not obj:
                 # No object yet; use root dictionary provided
-                obj		= root.get( name )
+                obj             = root.get( name )
             else:
                 if name in dir( obj ):
-                    obj		= getattr( obj, name )
+                    obj         = getattr( obj, name )
             if not obj:
                 break
         return obj
@@ -507,32 +522,31 @@ class server( object ):
         in the supplied root namespace, and avoiding re-searching the object
         heirarchy every time an invalid method is requested.
         """
-        method			= self.cache.get( target )
+        method                  = self.cache.get( target )
         if not method:
             # All names before the last one identify a chain of objects
-            terms		= target.split('.')
-            path		= terms[:-1]
-            pathstr		= '.'.join( path )
-            name		= terms[-1]
+            terms               = target.split('.')
+            path                = terms[:-1]
+            pathstr             = '.'.join( path )
+            name                = terms[-1]
             if path:
                 # A path; Must be a bound method of an object
                 if pathstr not in self.cache:
                     # ...and we haven't previously searched this object's methods.
                     self.cache[pathstr] = None
-                    obj		= self.find_object( path, root )
+                    obj         = self.find_object( path, root )
                     if obj:
                         for m in self.public_methods( obj ):
                             self.cache[pathstr + '.' + m] = getattr( obj, m )
-                        method	= self.cache.get( target )
+                        method  = self.cache.get( target )
             else:
                 # No path; Must be a simple function in the root scope
                 if not self.filter_method( name ):
-                    method	= root.get( name )
+                    method      = root.get( name )
             if not method:
                 # Still not found; memoize as invalid method
                 self.cache[target] = None
-        print "server.resolve: %s ==> %s" % (
-            target, repr( method ) if method else "None, in " + repr( root.keys() ))
+
         return method
 
     def error( self, exception, request ):
@@ -541,7 +555,7 @@ class server( object ):
         encoded request 'req', returning an appropriate Error exception.
 
         Override if further exception information must be retained and/or logged
-        (eg. for subsequent calls to interrogate the exception details)
+        (eg. to support subsequent calls to collect details of the exception)
         """
         if isinstance( exception, Error ):
             return exception
@@ -558,26 +572,24 @@ class server( object ):
 
         Must trap all Exceptions, and return an appropriate reply message.
         """
-        replies			= []
-        received		= socket.recv_multipart()
-        separator		= received.index('')
-        prefix			= received[:separator+1]
-        print "Server rx: [%s]" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in received ] ))
+        replies                 = []
+        received                = socket.recv_multipart()
+        separator               = received.index('')
+        prefix                  = received[:separator+1]
+
         for request in received[separator+1:]:
-            rpy			= {
-                'id':		None,
-                'jsonrpc':	JSONRPC_VERSION,
-                'result':	None,
-                'error':	None,
+            rpy                 = {
+                'id':           None,
+                'jsonrpc':      JSONRPC_VERSION,
+                'result':       None,
+                'error':        None,
                 }
             try:
                 # Attempt to un-marshall the JSON-RPC
                 try:
-                    req 		= json.loads( request )
+                    req                 = json.loads( request )
                     assert req['jsonrpc'] == JSONRPC_VERSION
-                    rpy['id']		= req['id']
+                    rpy['id']           = req['id']
                 except Exception, e:
                     raise Error( INVALID_REQUEST,
                                  data="Bad JSON-RPC: " + str(e))
@@ -586,27 +598,24 @@ class server( object ):
                     raise Error( INVALID_PARAMS, data="Must be a list" )
                 
                 # Valid JSON-RPC data.  Attempt to resolve method
-                method		= self.resolve( req['method'], self.root )
+                method          = self.resolve( req['method'], self.root )
                 if not method:
                     raise Error( METHOD_NOT_FOUND,
                                  data="No method named '%s'" % ( req['method'] ))
                 
                 # Attempt to dispatch method; *arbitrary* exceptions!
-                rpy['result']		= method( *req['params'] )
+                rpy['result']           = method( *req['params'] )
             except Exception, e:
-                # The Error Exception is designed so it's dict contains JSON-RPC
+                # The Error Exception is designed so its dict contains JSON-RPC
                 # appropriate attributes!  All other rpy items are correct (eg.
                 # 'result' will retail None, 'til method is dispatched without
                 # exception!
-                rpy['error']		= self.error( e, req ).__dict__
+                rpy['error']            = self.error( e, req ).__dict__
 
             if rpy['id']:
                 # Not a JSON-RPC Notification; append response for this request
                 replies.append( json.dumps( rpy, **JSON_OPTIONS ))
 
-        print "Server tx: [%s]" % (
-            ", ".join( [ zhelpers.format_part( m )
-                         for m in prefix + replies ] ))
         socket.send_multipart( replies, prefix=prefix )
 
     def receive( self ):
@@ -623,13 +632,11 @@ class stoppable( threading.Thread ):
     Supports external thread-safe Thread stop signalling.
     """
     def __init__( self, *args, **kwargs ):
-        self.__stop	 	= threading.Event()
+        self.__stop             = threading.Event()
         super( stoppable, self ).__init__( *args, **kwargs )
-        print "%s.__init__" % ( self )
 
     def stop( self ):
         self.__stop.set()
-        print "%s.stop" % ( self )
 
     def stopped( self ):
         return self.__stop.is_set()
@@ -642,17 +649,17 @@ class stoppable( threading.Thread ):
 class server_thread_base( stoppable ):
     """
     If combined with a server-derived class, this method will process server's
-    incoming RPC requests 'til stopped.
+    incoming RPC requests 'til stopped/failed, and then always invoke cleanup.
     """
     def __init__( self, **kwargs ):
         stoppable.__init__( self, **kwargs )
 
     def run( self ):
-        print "%s.run w/ latency=%s" % ( self, self.latency )
-        while not self.stopped():
-            self.receive()
-        print "%s.run complete" % ( self )
-        self.cleanup()
+        try:
+            while not self.stopped():
+                self.receive()
+        finally:
+            self.cleanup()
 
 
 class server_thread( server, server_thread_base ):
@@ -695,7 +702,8 @@ class client_session( client ):
         
     """
     # All client object's session pool monitors, keyed by monitor address.
-    _pools			= {}
+
+    _pools                      = {}
 
     def __init__( self, socket, name="", context=None ):
         """
@@ -714,29 +722,29 @@ class client_session( client ):
         # Allocate a server session for this client, blocking 'til available.
         # This is a one-shot request; client is discarded immediately after use,
         # and socket is never used again.
-        monitor, session	= client( socket=socket, name="self" ).allocate()
+        monitor, session        = client( socket=socket, name="self" ).allocate()
 
         # Open the socket to the given server session allocated to this client.
         # Ensure object is fully initialized, so __getattr__ operates, before
         # using any object attributes!
         if context is None:
-            context		= zmq.Context()
-        sess_sock		= context.socket( zmq.REQ )
+            context             = zmq.Context()
+        sess_sock               = context.socket( zmq.REQ )
         sess_sock.connect( session )
         super( client_session, self ).__init__( socket=sess_sock, name=name )
 
-        self._session		= session
+        self._session           = session
 
         # Open a socket to the monitor, if none already exists.
 
         # TODO: clients sharing the same context share a common set of monitors.
-        moni			= self._pools.get( monitor )
+        moni                    = self._pools.get( monitor )
         if not moni:
-            moni_sock	        = context.socket( zmq.REQ )
+            moni_sock           = context.socket( zmq.REQ )
             moni_sock.connect( monitor )
             self._pools[monitor]= client( socket=moni_sock, name="self" )
 
-        self._monitor		= monitor
+        self._monitor           = monitor
 
         # TODO create a ping thread to ping the monitor, to track the health of
         # this session's server.
@@ -745,19 +753,11 @@ class client_session( client ):
         """
         Ensure that the remote session pool is allowed to recycle the session.
         """
-        moni			= self._pools.get( self._monitor )
+        moni                    = self._pools.get( self._monitor )
         if moni:
             moni.release( self._session )
 
 
-
-def logcall( method ):
-    def wrapper( *args, **kwargs ):
-        print "calling %s( %s )" % ( method.__name__, ", ".join(
-                [ str( a ) for a in args ]
-                + [ "%s=%s" % ( k, str( v )) for k, v in kwargs.items() ] ))
-        return method( *args, **kwargs )
-    return wrapper
 
 # 
 # server_session_monitor
@@ -768,7 +768,7 @@ def logcall( method ):
 # __init__:
 #     pool      -- the server_session pool to monitor
 # 
-# ping		-- RPC API; returns None if OK, exception on pool failure
+# ping          -- RPC API; returns None if OK, exception on pool failure
 # 
 class server_session_monitor( server ):
     """
@@ -784,7 +784,7 @@ class server_session_monitor( server ):
         Remember the pool in an inaccessible member variable, and allow RPC
         access only to local 'self'.
         """
-        self.pool		= pool
+        self.pool               = pool
         super( server_session_monitor, self ).__init__(
             root={ 'self': self }, socket=socket, latency=latency )
 
@@ -792,7 +792,7 @@ class server_session_monitor( server ):
         return [ 'ping', 'release' ]
 
     def ping( self ):
-        print "ping: %s" % repr( self._pool )
+        pass
 
     def release( self, session ):
         """
@@ -828,25 +828,25 @@ class server_session( server ):
         # The _monitor socket (bound on iface:port) is used for direct
         # connection.  An integer port number is required, and all sockets will
         # begin at that port number.
-        self._context		= context or zmq.Context()
-        self._monitor_addr	= "tcp://%s:%d" % ( iface, port )	
-        socket			= self._context.socket( zmq.XREP )
+        self._context           = context or zmq.Context()
+        self._monitor_addr      = "tcp://%s:%d" % ( iface, port )       
+        socket                  = self._context.socket( zmq.XREP )
         socket.bind( self._monitor_addr )
-        self._monitor		= server_session_monitor_thread(
+        self._monitor           = server_session_monitor_thread(
             pool=self, socket=socket, latency=latency )
         self._monitor.start()
-        self._idle		= {}
+        self._idle              = {}
 
         # Session server threads on subsequent ports, all with access to the
         # 'root' dict of objects.
         for n in xrange( 0, pool ):
-            socket		= self._context.socket( zmq.XREP )
-            addr		= "tcp://%s:%d" % ( iface, port + 1 + n )
+            socket              = self._context.socket( zmq.XREP )
+            addr                = "tcp://%s:%d" % ( iface, port + 1 + n )
             socket.bind( addr )
-            self._idle[addr]	= server_thread( 
+            self._idle[addr]    = server_thread( 
                 root=root, socket=socket, latency=latency )
             self._idle[addr].start()
-        socket			= None
+        socket                  = None
 
     def threads( self ):
         return [ self._monitor ] + self._idle.values()
@@ -868,7 +868,7 @@ class server_session( server ):
         """
         return [ "allocate", "release" ]
 
-    @logcall
+    #@logcall
     def allocate( self ):
         """
         Return the 0MQ socket address of the server_session pool monitor, and
@@ -876,9 +876,8 @@ class server_session( server ):
         """
         return self._monitor_addr, random.choice( self._idle.keys() )
 
-    @logcall
+    #@logcall
     def release( self, session ):
-        print "Releasing session: %s" % ( session )
         pass
 
 class server_session_thread( server_session, server_thread_base ):

@@ -94,13 +94,13 @@ def test_sending_receiver_ids():
         xreqa.send_multipart( [ '', 'something' ] )
         if ver in ("2.1", "3.1"):
             rx			= xrepb.recv_multipart()
-            print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
-                                           for msg in rx ] )
+            #print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
+            #                               for msg in rx ] )
             assert len( rx ) == 3
         elif ver in ("3.0"):
             labels, rx		= xrepb.recv_multipart()
-            print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
-                                           for msg in labels + rx ] )
+            #print "msg: %s" % ", ".join( [ zhelpers.format_part( msg )
+            #                               for msg in labels + rx ] )
             assert len( labels ) == 1
             assert len( rx ) == 2
         else:
