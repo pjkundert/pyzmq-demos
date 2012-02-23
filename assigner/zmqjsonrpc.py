@@ -212,11 +212,12 @@
 
 
 import json
+import random
 import threading
+import time
 import traceback
 import zhelpers
 import zmq
-import random
 
 JSONRPC_VERSION                 = "2.0"
 
@@ -248,10 +249,12 @@ def logcall( method ):
     @logcall    -- decorator to log method invocations
     """
     def wrapper( *args, **kwargs ):
-        print "calling %s( %s )" % ( method.__name__, ", ".join(
+        print "%s <- ( %s )..." % ( method.__name__, ", ".join(
                 [ str( a ) for a in args ]
                 + [ "%s=%s" % ( k, str( v )) for k, v in kwargs.items() ] ))
-        return method( *args, **kwargs )
+        result = method( *args, **kwargs )
+        print "%s -> %s" % ( method.__name__, repr( result ))
+        return result
     return wrapper
 
 
@@ -881,7 +884,11 @@ class server_session( server ):
         self._monitor           = server_session_monitor_thread(
             pool=self, socket=socket, latency=latency )
         self._monitor.start()
+
+        # The following may be accessed from multiple threads; serialize access
+        self._lock              = threading.Lock() # Not reentrant; no recursive calls!
         self._idle              = {}
+        self._busy              = {}
 
         # Session server threads on subsequent ports, all with access to the
         # 'root' dict of objects.
@@ -895,7 +902,8 @@ class server_session( server ):
         socket                  = None
 
     def threads( self ):
-        return [ self._monitor ] + self._idle.values()
+        with self._lock:
+            return [ self._monitor ] + self._idle.values() + self._busy.values()
 
     def join( self, *args, **kwargs ):
         """
@@ -906,25 +914,34 @@ class server_session( server ):
         super( server_session, self ).join( *args, **kwargs )
 
     # The server_session itself only responds to RPC requests to allocate new
-    # sessions.  The corresponding _release is issued (locally) by the session
-    # server thread, to put itself back in the pool.
+    # sessions.  The corresponding 'release' is issued (locally) by the session
+    # server_session monitor thread, and puts itself back in the pool.
     def __dir__( self ):
         """
         Return only publicly accessible RPC methods via dir(...).
         """
-        return [ "allocate", "release" ]
+        return [ "allocate" ]
 
-    #@logcall
+    @logcall
     def allocate( self ):
         """
         Return the 0MQ socket address of the server_session pool monitor, and
         the specific session server allocated.
         """
-        return self._monitor_addr, random.choice( self._idle.keys() )
+        while True:
+            with self._lock:
+                if self._idle:
+                    session, thread     = self._idle.popitem()
+                    self._busy[session] = thread
+                    return self._monitor_addr, session
+            # TODO: Missed!  Wait a bit...  Should use blocking queues...
+            time.sleep(.01)
 
-    #@logcall
+    @logcall
     def release( self, session ):
-        pass
+        with self._lock:
+            self._idle[session] = self._busy.pop( session )
+
 
 class server_session_thread( server_session, server_thread_base ):
     def __init__( self, root, socket=None, latency=.25,
