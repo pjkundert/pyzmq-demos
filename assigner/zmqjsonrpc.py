@@ -301,7 +301,18 @@ class client( object ):
 
     Not threadsafe; all invocations are assumed to be serialized on the client.
 
+    Any instance attribute not found is assumed to be a remote method, and
+    returns a callable which may be used (repeatedly, if desired) to invoke the
+    remote method.
+
+    Presents no public methods (all methods invoked on 'client' instance are
+    assumed to be remote); Override non-public '_...' methods to alter basic
+    default behaviour.
+
     EXAMPLE
+
+        import zmq
+        import zmqjsonrpc
 
         # Create 0MQ transport
         context         = zmq.Context()
@@ -310,19 +321,12 @@ class client( object ):
         remote          = client( socket=socket, name="boo" )
 
         # Creates callable to method "first" and invokes; then "second"
-        result1         = remote.first( "some", "args" )
-        result2         = remote.second( "yet", "others" )
+        print "first:  %s" % ( remote.first( "some", "args" ))
+        print "second: %s" % ( remote.second( "yet", "others" ))
 
         # Clean up; destroy proxy (closes socket), terminate context
         del remote
         context.term()
-
-    Any instance attribute not found is assumed to be a remote method, and
-    returns a callable which may be used (repeatedly, if desired) to invoke the
-    remote method.
-
-    No public methods (all methods invoked are assumed to be remote) Override
-    non-public '_...' methods to alter basic default behaviour.
     """
 
     def __init__( self, socket, name="" ):
@@ -427,15 +431,48 @@ class server( object ):
     Alternatively, you may override and customize 'find_object', 'all_methods',
     'public_methods' or 'filter_method' to enforce some other object/method
     access control methodology.
+
+    EXAMPLE
+
+        import zmq
+        import zmqjsonrpc
+        
+        # Create some objects to access remotely
+        class Boo( object ):
+            def first( self, *args ):
+                return ", ".join( str( a ) for a in args ))
+
+            second              = first
+
+        boo                     = Boo()
+
+        # Create 0MQ transport
+        context         = zmq.Context()
+        socket          = context.socket( zmq.XREP )
+        socket.bind( "tcp://*:55151" )
+        
+        # Serve RPC requests forever (or 'til Ctrl-C, whichever comes first),
+        # to *any* global object.  Restrict access with different 'root' dict
+        zmqjsonrpc.server( socket=socket, root=globals() ).serve()
+        
+        # Clean up 0MQ socket (management assumed by server), and context
+        del server
+        context.term()
+        
+        
     """
     def __init__( self, root, socket=None, latency=None ):
+        """
+        Serve RPC requests.  By default, blocks forever; provide a non-zero
+        latency in seconds to allow 'receive' to return after inactivity.
+        """
         assert type( root ) is dict
         self.root               = root
         self.poller             = zmq.core.poll.Poller()
         self.socket             = socket
         if self.socket:
             self.register( self.socket )
-        self.latency            = float( latency or 0.25 )
+        self.latency            = latency
         self.cache              = {}
 
     def __del__( self ):
@@ -618,13 +655,20 @@ class server( object ):
 
         socket.send_multipart( replies, prefix=prefix )
 
-    def receive( self ):
+    def serve( self ):
         """
-        Receives and processes incoming requests until the predefined timeout
-        has passed with no activity.
+        Receives and processes incoming requests until the predefined
+        'self.latency' timeout has passed with no activity (default of 'None'
+        waits forever).  Returns True iff at least one RPC was served.
         """
-        for socket, _ in self.poller.poll( timeout=self.latency ):
-            self.process( socket )
+        active                  = True
+        while active:
+            active              = False
+            for socket, _ in self.poller.poll( timeout=self.latency ):
+                self.process( socket )
+                active          = True
+
+        return active
         
 
 class stoppable( threading.Thread ):
@@ -657,7 +701,7 @@ class server_thread_base( stoppable ):
     def run( self ):
         try:
             while not self.stopped():
-                self.receive()
+                self.serve()
         finally:
             self.cleanup()
 
@@ -666,8 +710,10 @@ class server_thread( server, server_thread_base ):
     """
     A JSON-RPC server Thread, which receives requests, and stops (within the
     server's predefined 'latency') when joined.
+
+    Default for latency provides for periodic 'stopped' checks.
     """
-    def __init__( self, root, socket=None, latency=None, **kwargs ):
+    def __init__( self, root, socket=None, latency=.25, **kwargs ):
         server.__init__( self, root=root, socket=socket, latency=latency )
         server_thread_base.__init__( self, **kwargs )
 
@@ -685,9 +731,9 @@ class client_session( client ):
         1) request a session from 1:M REQ:REP pool of server_session
 
     We obtain a server socket that is connected to a remote server.  This is
-    used to verify the liveliness of that server(running in
-    a single thread), before returning our first 'client._remote' proxy
-    instance, and deallocate that remote server it at time of destruction.
+    used to verify the liveliness of that server(running in a single thread),
+    before returning our first 'client._remote' proxy instance, and deallocate
+    that remote server it at time of destruction.
 
 
         2) receive address to establish server socket (for heartbeats,
@@ -801,7 +847,7 @@ class server_session_monitor( server ):
         self.pool.release( session )
 
 class server_session_monitor_thread( server_session_monitor, server_thread_base ):
-    def __init__( self, pool, socket=None, latency=None, **kwargs ):
+    def __init__( self, pool, socket=None, latency=.25, **kwargs ):
         server_session_monitor.__init__(
             self, pool=pool, socket=socket, latency=latency )
         server_thread_base.__init__( self, **kwargs )
@@ -881,9 +927,9 @@ class server_session( server ):
         pass
 
 class server_session_thread( server_session, server_thread_base ):
-    def __init__( self, root, socket=None, latency=None,
+    def __init__( self, root, socket=None, latency=.25,
                   pool=5, iface=None, port=None,  **kwargs ):
         server_session.__init__(
             self, root=root, socket=socket, latency=latency,
-            pool=pool, iface=iface, port=port)
+            pool=pool, iface=iface, port=port )
         server_thread_base.__init__( self, **kwargs )

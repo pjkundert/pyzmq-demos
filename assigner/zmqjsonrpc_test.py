@@ -97,6 +97,8 @@ def test_rpc_base_1_to_N():
 def test_rpc_session():
     global port
     
+    iface			= "127.0.0.1"
+
     # Create 0MQ transport
     context                     = zmq.Context()
     cli                         = context.socket( zmq.REQ )
@@ -104,7 +106,7 @@ def test_rpc_session():
 
     # Create the test server and connect client to it
     svr                         = context.socket( zmq.XREP )
-    svr.bind( "tcp://*:%d" % ( port ))
+    svr.bind( "tcp://%s:%d" % ( iface, port ))
     port                       += 1
     pool                        = 5
 
@@ -112,9 +114,9 @@ def test_rpc_session():
     # 'boo') Uses one port for the monitor socket, plus 'pool' ports
     # for the server pool.
     svrthr                      = zjr.server_session_thread(
-        root=globals(), socket=svr, pool=pool, iface="127.0.0.1", port=11245 )
+        root=globals(), socket=svr, pool=pool, iface=iface, port=port )
     svrthr.start()
-    port                        += 1 + pool
+    port                        += pool
 
     # Create a client_session, attempting to access methods of "boo"
     remses                      = zjr.client_session( socket=cli, name="boo" )
